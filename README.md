@@ -499,11 +499,11 @@ CVnC/CvVnC 方案默认 120bpm 五字表，而普通话 nCV 是 120bpm 八字表
 
 <img width="597" height="546" alt="元音到尾音(_A&#39;k)" src="https://github.com/user-attachments/assets/c024eb99-a853-4de6-a29f-ef51f29cb9ba" />
 
-以这个例子，混响有点大的话那就看标注者的经验了。
+说明：以这个例子，混响有点大的话那就看标注者的经验了。
 
 <img width="583" height="533" alt="元音到尾音(_a&#39;m)" src="https://github.com/user-attachments/assets/7ef250dd-c3a8-46fc-bae0-d8651a38bb0a" />
 
-其实这些入声与非入声与粤语 syo 差不多，不要把右边界放到尾音结束，而是放在开始结束的位置就行。
+说明：其实这些入声与非入声与粤语 syo 差不多，不要把右边界放到尾音结束，而是放在开始结束的位置就行。
 
 #### nV：尾音到元音
 
@@ -513,7 +513,7 @@ CVnC/CvVnC 方案默认 120bpm 五字表，而普通话 nCV 是 120bpm 八字表
 
 <img width="540" height="539" alt="尾音到元音(p~ e&#39;)" src="https://github.com/user-attachments/assets/c0e0ae4f-4059-42f3-ae7f-af65a30d67db" />
 
-对于入声后的元音，气泡音判定为辅助且提前一拍的发音，预发声放在前方；如果比较短或者气泡音不明显到成为辅音的程度，那就放在于发声后一点的地方。
+说明：对于入声后的元音，气泡音判定为辅助且提前一拍的发音，预发声放在前方；如果比较短或者气泡音不明显到成为辅音的程度，那就放在于发声后一点的地方。
 
 #### VV：元音到元音
 
