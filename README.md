@@ -655,7 +655,7 @@ CVnC/CvVnC 方案默认 120bpm 五字表，而普通话 nCV 是 120bpm 八字表
 
 - 录音表生成器及附带的分割文件：<https://github.com/XieYunP/reclisrgen_plus_plus>
 - 自动标注器扩展：<https://github.com/XieYunP/TextGrid2oto_cvnc_plugin>
-- CVvC/CvVvC 制作包：<https://github.com/XieYunP/CVnC_CvVnC_Pack>
+- CVvC/CvVvC 制作包：<https://github.com/XieYunP/CVnC_CvVnC_Pack>（音素器使用deepseek辅助开发）
 
 # 4. 题外话及鸣谢
 
