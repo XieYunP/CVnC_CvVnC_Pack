@@ -458,7 +458,7 @@ CVnC/CvVnC 方案默认 120bpm 五字表，而普通话 nCV 是 120bpm 八字表
 
 <img width="577" height="527" alt="尾音到元音(u~ O)" src="https://github.com/user-attachments/assets/cbc54f1c-e8c4-499c-8e75-43c36076ccb5" />
 
-说明：类似 vcv 的形式，但是连接辅音，记得连接辅音，如 VV。
+说明：类似 vcv 的形式，注意纯元音没有辅音，预发声就在元音开始点就行。
 
 #### - C：开头辅音
 
