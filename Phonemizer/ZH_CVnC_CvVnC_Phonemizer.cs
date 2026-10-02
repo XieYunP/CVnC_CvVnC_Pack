@@ -479,7 +479,7 @@ namespace OpenUtau.Core
             int mainRaw = 0;
             if (mainIsFixed)
             {
-                // main 的介母长度 = Preutter
+                // a = main 自己的 Preutter
                 int a = 0;
                 if (singer != null && singer.TryGetMappedOto(rule.Main,
                         note.tone + attr.toneShift, attr.voiceColor, out var mainOto))
@@ -488,9 +488,8 @@ namespace OpenUtau.Core
                     if (a < 0) a = 0;
                 }
 
-                // med 的介母长度 = Preutter；medOverlap 最多抵消到 Preutter
+                // b = 下一个介母衔接部的 Preutter
                 int b = 0;
-                int medOverlap = 0;
                 if (singer != null)
                 {
                     foreach (var t in rule.TransitionPhonemes)
@@ -504,30 +503,30 @@ namespace OpenUtau.Core
                         {
                             b = (int)otoM.Preutter;
                             if (b < 0) b = 0;
-
-                            int mo = (int)otoM.Overlap;
-                            if (mo < 0) mo = 0;
-                            medOverlap = Math.Min(mo, b);   // 溢出红线的不算
                             break;
                         }
                     }
                 }
 
-                if (a > 0 && b > 0)
-                    mainRaw = (a + b - medOverlap) / 2;
-                else if (a > 0)
-                    mainRaw = a;
-                else if (b > 0)
-                    mainRaw = b;
-                else
-                    mainRaw = GetVoiceLength(rule.Main, note, attr);
+                // 取最短者，避免前后速度突变
+                if (a > 0 && b > 0) mainRaw = Math.Min(a, b);
+                else if (a > 0) mainRaw = a;
+                else if (b > 0) mainRaw = b;
+                else mainRaw = GetVoiceLength(rule.Main, note, attr);
 
                 int minMain = Math.Max(20, totalDuration / 10);
                 if (mainRaw < minMain) mainRaw = minMain;
                 if (mainRaw > totalDuration / 3) mainRaw = totalDuration / 3;
             }
+            else
+            {
+                mainRaw = GetVoiceLength(rule.Main, note, attr);
+                int minMain = Math.Max(20, totalDuration / 10);
+                if (mainRaw < minMain) mainRaw = minMain;
+                if (mainRaw > totalDuration / 3) mainRaw = totalDuration / 3;
+            }
 
-            // 4. 介母期望时长 = Preutter
+            // 4. 介母期望时长 = max(Preutter, Overlap)
             int[] medialExpected = new int[transitions.Count];
             for (int i = 0; i < transitions.Count; i++)
             {
@@ -537,8 +536,11 @@ namespace OpenUtau.Core
                         note.tone + attr.toneShift, attr.voiceColor, out var otoSelf))
                 {
                     int pre = (int)otoSelf.Preutter;
-                    if (pre < 20) pre = 20;
-                    medialExpected[i] = pre;
+                    int ov = (int)otoSelf.Overlap;
+                    if (ov < 0) ov = 0;
+                    int expected = Math.Max(pre, ov);
+                    if (expected < 20) expected = 20;
+                    medialExpected[i] = expected;
                 }
                 else
                 {
@@ -566,6 +568,7 @@ namespace OpenUtau.Core
 
             if (totalDuration >= fixedSum + minVowelSpace)
             {
+                // ---- 空间够：固定部不动，拉伸部按期望时长分配 ----
                 // ---- 空间够：固定部不动，拉伸部按期望时长分配 ----
                 int remaining = totalDuration - fixedSum;
                 int perStretch = stretchCount > 0 ? Math.Max(1, remaining / stretchCount) : 0;
@@ -611,22 +614,20 @@ namespace OpenUtau.Core
             for (int i = transitions.Count - 1; i >= 0; i--)
             {
                 cursor -= actualTrans[i];
-                if (cursor < minMain2) cursor = minMain2;   // ← 不许越过 main 保底位
+                if (cursor < minMain2) cursor = minMain2;
                 positions[i] = cursor;
             }
 
-            // 6b. 介母：紧贴 main 右边缘，不再从右边缘往回推
+            // 6b. 介母：紧贴 main 右边缘，占据剩余空间
             int mainRight = mainIsFixed ? mainRaw : 0;
 
             for (int i = 0; i < transitions.Count; i++)
             {
                 if (!transitions[i].isMedial) continue;
 
-                // 直接放在 main 右边缘
                 int newPos = mainRight;
                 if (newPos < 0) newPos = 0;
 
-                // 防止越过下一锚点
                 int nextAnchor = (i + 1 < transitions.Count)
                     ? positions[i + 1]
                     : totalDuration - actualEnding;

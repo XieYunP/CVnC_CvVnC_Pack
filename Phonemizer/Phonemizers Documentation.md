@@ -1,467 +1,435 @@
-# ZH CVnC/CvVnC Phonemizer & ZH YUE CVnC/CvVnC Phonemizer
-## 音素化器技术文档
+```markdown
+# TextGrid2oto — CVNC / CVVNC / NCV 扩展
 
----
+## 相关项目
 
-## 一、项目概览
+### 原项目说明书
 
-本插件为 OpenUtau 提供两个音素化器：
+本扩展基于原项目 TextGrid2oto 开发，原项目的完整说明书（含 CV / CVVC / VCV / ARPAsing 的详细操作流程、环境配置、模型下载说明等）请见：
 
-| # | 类名 | Tag | 语言 |
-|---|------|-----|------|
-| 1 | `ZHCVnCCvVnCPhonemizer` | `ZH CVnC/CvVnC` | ZH |
-| 2 | `ZHYUECVnCCvVnCPhonemizer` | `ZH YUE CVnC/CvVnC` | ZH-YUE |
+- <https://github.com/xiaobaijunya/TextGrid2oto>
 
-两者共享同一套音素分配逻辑，唯一区别：
+本扩展只新增了 CVNC / CVVNC / NCV 方案的生成逻辑，不修改原项目已有的 CV / CVVC / VCV / ARPAsing 功能。原项目说明书里的环境配置、模型下载、lab 生成、TextGrid 推理、JSON 生成等步骤，在本扩展里完全适用。
 
-- **普通话版**：`Romanize` 使用 `BaseChinesePhonemizer.Romanize`（汉字 → 无声调拼音）
-- **粤语版**：`Romanize` 使用 `Pinyin.Jyutping.Instance.HanziToPinyin`（汉字 → 无声调粤拼）
+### 分割文件与模板生成
 
-**适用声库**：CVnC / CvVnC 拆音方案（VCCV 风格，含介母、韵尾衔接部）
+本扩展所需的 RULE 文件（分割文件）和 oto 模板，可以从 reclistgen++ 获得：
 
-**依赖**：
+- <https://github.com/XieYunP/reclistgen_plus_plus>
 
-- `OpenUtau.dll` / `OpenUtau.Core.dll` / `OpenUtau.Plugin.Builtin.dll`
-- `Serilog.dll`
-- `Pinyin.dll`（仅粤语版需要 Jyutping）
+reclistgen++ 是一个录音表 + oto 模板生成器，可以：
 
----
+- 生成录音表（reclist），即每个音节在录音时对应的文件名
+- 生成与录音表配套的 oto 模板（虚拟拍子时间戳）
+- 导出 RULE 格式的分割文件（`拼音=辅音,整音,transition列表,coda`）
 
-## 二、文件组成
+用 reclistgen++ 生成分割文件和模板后，在本扩展的面板里：
 
-**普通话版**：
+| 面板字段 | 选择 |
+|---|---|
+| 规则文件 | reclistgen++ 导出的 RULE 文件 |
+| 模板 oto | reclistgen++ 导出的 oto 模板 |
 
-- `ZH_CVnC_CvVnC_Phonemizer.cs`
-- 目标框架：`net8.0-windows`
+> **注意**：模板里的时间戳是虚拟拍子时间（如 44 / 544 / 1044 / …），不是真实音频毫秒数。本扩展的模板对齐逻辑只把模板当作"白名单 + 顺序"使用，时间戳始终由生成侧按当前音频的拼音位置重算，不会直接采用模板的虚拟时间戳。
 
-**粤语版**：
+## 一、项目简介
 
-- `ZH_YUE_CVnC_CvVnC_Phonemizer.cs`
-- 目标框架：`net8.0-windows`
+本项目在原 TextGrid2oto 基础上，扩展了一套 CVNC / CVVNC / NCV 方案的 oto.ini 自动生成功能。
 
-**项目文件 (.csproj) 参考**：
+### 三种术语的定义
 
-```xml
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
-  <ItemGroup>
-    <Reference Include="OpenUtau">
-      <HintPath>...\OpenUtau.dll</HintPath>
-    </Reference>
-    <Reference Include="OpenUtau.Core">
-      <HintPath>...\OpenUtau.Core.dll</HintPath>
-    </Reference>
-    <Reference Include="OpenUtau.Plugin.Builtin">
-      <HintPath>...\OpenUtau.Plugin.Builtin.dll</HintPath>
-    </Reference>
-    <Reference Include="Serilog">
-      <HintPath>...\Serilog.dll</HintPath>
-    </Reference>
-    <!-- 仅粤语版需要 -->
-    <Reference Include="Pinyin">
-      <HintPath>...\Pinyin.dll</HintPath>
-    </Reference>
-  </ItemGroup>
-</Project>
+**CVNC**
+
+- 辅音 + 元音 + 韵尾
+- 标准带韵尾的音节，如 `guan`（g + ua + n）
+- 在 VCCV 模式下，韵尾 n 会连接到下一个音节的辅音
+
+**CVVNC**
+
+- 辅音 + 介母 + 元音 + 韵尾
+- 带介母的三拼音节，如 `guan`（g + u + a + n）
+- 介母 i 和元音 a 之间的过渡属于字内衔接（transition），韵尾 n 的处理与 CVNC 相同
+
+**NCV**
+
+- 跨音节的衔接方式，不是单个音节的结构
+- 指上一音节的韵尾（N）直接连接到下一音节的整音（V），不再经过下一音节的辅音（C）
+- 这正是 VCV 模式的核心特征（N → V）；而 VCCV 模式是 N → C，即韵尾先连接到下一音节的辅音
+
+### 关键区别
+
+- **CVNC / CVVNC** 描述的是音节内部的组成（有没有介母、有没有韵尾）
+- **NCV** 描述的是音节之间的衔接方式（韵尾接元音，还是韵尾接辅音）
+- 如果用 CVNC / CVVNC 的分割表但选了 VCV 模式，上一个音的韵尾会直接连到下一个音节的整音（包括介母整音和普通整音），而不是连到下一个辅音——这就是 NCV 行为
+
+### 原项目地址
+
+- <https://github.com/xiaobaijunya/TextGrid2oto>
+
+### 核心思路
+
+用 `ds_phone_filter.json` + `word_phone.json` 的时间戳精确切分每个音节的辅音段 / 元音段 / 韵尾段，再用 RULE 文件里的字内衔接声明（transition 数量 + coda 是否带 `~`）判定该音节走两段式 / 三段式 / 四段式，最后按公式算出每个 oto 条目的 `offset / consonant / cutoff / preutterance / overlap`。
+
+## 二、操作说明
+
+### 基本流程
+
+1. 打开面板：Mark 标签页 → CVNC/CVVNC/NCV 方案自动生成
+2. 准备输入：
+   - **规则文件**：RULE 文件（`.ini` 或 `.txt`），格式见下节
+   - **声库文件夹**：包含 `json/ds_phone_filter.json` 和 `json/word_phone.json` 的目录
+   - **模板 oto**（可选）：白名单式 oto，用于限定要生成哪些条目
+3. 配置参数（见第三节）
+4. 点击"生成 oto"：产出 `声库文件夹/oto.ini`
+5. 结果窗口显示：条目数、缺失别名、警告、模板未匹配项
+
+### RULE 文件格式
+
 ```
-
-**安装**：将编译好的 `.dll` 复制到 `OpenUtau安装目录\Plugins\` 后重启。
-
----
-
-## 三、scheme.ini 规则文件格式
-
-**位置优先级**：
-
-1. 声库目录 `\<singer.Location>\scheme.ini`
-2. 插件目录 `\scheme.ini`
-
-**每一行格式**：
-
+拼音=辅音,整音,transition列表,coda
 ```
-pinyin_or_jyutping = Prefix, Main, "Transition1,Transition2,...", Ending
-```
-
-**字段说明**：
 
 | 字段 | 说明 |
-|------|------|
-| `Prefix` | 开头/连接辅音（如 `b`、`ch`、`x`），可为空 |
-| `Main` | 主音素（CV 或元音部分，如 `bA`、`xi_`、`la`） |
-| `Transition` | 过渡音素，用逗号分隔，可多个，用双引号包裹，可为空 |
-| `Ending` | 尾音（如 `u~`、`n~`、`ng~`），可为空 |
+|---|---|
+| 辅音 | 声母（可以为空，如 `a=,a,,a`） |
+| 整音 | 音节整体称呼（如 `bao` 的整音是 `bA`） |
+| transition 列表 | 1 个或 2 个（逗号分隔），用于字内衔接 |
+| coda | 韵尾；带 `~` 表示该音节有独立韵尾段 |
 
-**命名后缀约定**：
+示例：
 
-| 命名 | 性质 | 示例 |
-|------|------|------|
-| 以 `_` 结尾 | 介母衔接部（拉伸） | `ie'_`、`uo_`、`iA_` |
-| 以 `_` 开头 | 韵尾衔接部（固定） | `_Au`、`_e'n`、`_ing` |
-| 不以 `_` 结尾的 Main | 拉伸（元音主体） | `bA`、`la` |
-| 以 `_` 结尾的 Main | 固定 | `su_`、`xi_`、`ti_` |
-
-**示例行**：
-
-```ini
-xian   = x, xi_, "ie'_,_e'n", n~
-suo    = s, su_, "uo_", o
-bao    = b, bA, "_Au", u~
-la     = l, la, "", a
-ni     = n, ni, "", i
+```
+zen=z,zE,"_En",n~           无介母，1 个 transition（元音→韵尾）
+guan=g,gu_,"ua'_,_a'n",n~   有介母，2 个 transition
+jia=j,ji_,"ia_",a           有介母，1 个 transition（coda 不带 ~）
+ai=,a',"_a'i",i~            纯元音音节，有独立韵尾
+er=,er',"_er'",r'~          双元音性质，唯一 transition
 ```
 
----
+### 字内衔接判定规则
 
-## 四、核心概念
+| transition 数量 | coda 是否带 `~` | 判定 | 字内衔接生成 |
+|:---:|:---:|---|---|
+| 0 | — | 两段式 | 不生成 |
+| 1 | 否 | 四段式（有介母） | 类型 A |
+| 1 | 是 | 三段式（无介母） | 类型 B |
+| 2 | 任意 | 四段式（有介母） | 类型 A + 类型 B |
 
-### 4.1 音符组 (Note[] notes)
+## 三、参数详解
 
-OpenUtau 会把一个主音符以及它后面连续的 `+` 延音合并成一个 `Note[]` 数组传给 `Process`：
-
-- `notes[0]`：主音符（含真实歌词）
-- `notes[1..]`：所有 `+` 延音
-- `totalDuration = sum(notes[i].duration)`：整个音符合并后的总时长
-
-因此代码里不需要单独处理 `+`，只把 `totalDuration` 当作整体。
-
-### 4.2 固定音素 vs 拉伸音素
-
-**固定音素**：
-
-- 长度锁死在 oto 物理值上，不随 `totalDuration` 变化
-- 例：`_Au`、`_e'n`、`_ing`、`n~ R`、以 `_` 结尾的 Main（`su_`、`xi_`）
-
-**拉伸音素**：
-
-- 长度 = 上下两个固定锚点之间的空隙，自动填充
-- 例：`bA`、`la`、`ie'_`、`uo_`、`iA_`
-
-### 4.3 oto 字段
-
-`UOto` 包含：
+### 3.1 oto 字段基础
 
 | 字段 | 说明 |
-|------|------|
-| `Offset` | 音频起点偏移 |
-| `Consonant` | 辅音时长（从音素起点到元音开始） |
-| `Cutoff` | 右边界（负值，从音频末端往前数的距离） |
-| `Preutter` | 预发声时长 |
-| `Overlap` | 交叉淡入点 |
+|---|---|
+| `offset` | 条目在音频中的起始位置（ms） |
+| `consonant` | 固定段结束位置相对于 offset 的距离 |
+| `cutoff` | 右边界相对于 offset 的距离（一般为负值） |
+| `preutterance` | 预发声位置相对于 offset 的距离 |
+| `overlap` | 重叠位置相对于 offset 的距离 |
 
-**关键派生量**：
+所有公式内部算的是绝对毫秒（left / preutt / right / fixed / overlap），最后由 `_to_oto` 一次性转成相对值。
 
-- `voiceLen = (-Cutoff) - Preutter` — 预发声到右边界长度
-- `consonant = Consonant` — 辅音物理长度
+### 3.2 面板主参数
 
----
+#### 标记模式
 
-## 五、音素分配算法
+**自动**：按 RULE 的 transition 数量 + coda 是否带 `~` 判定模式：
 
-### 5.1 整体流程
+- RULE 有介母 → 四段式，对齐介母和韵尾
+- RULE 无介母 coda 带 `~` → 三段式，对齐韵尾
+- RULE 无介母 coda 无 `~` → 四段式但无介母，只有字内衔接 A
+
+三段式的独立韵尾段若 JSON 未切出，用假定位置（`assumed_pct`）代替。
+
+**强制二段式**：忽略 RULE，所有音节按两段式处理。字内衔接一律不生成。
+
+#### 规则文件
+
+RULE 文件路径。
+
+#### 声库文件夹
+
+含 `json/` 子目录的声库根目录。
+
+#### 开头音类型
+
+| 选项 | 含义 |
+|---|---|
+| 辅音 (- b) | 开头音别名用 `- <辅音>` |
+| 整音 (- bi_) | 开头音别名用 `- <整音>` |
+
+纯元音开头强制走整音，不受此项影响。
+
+#### 保留单独纯元音整音
+
+非开头位置的无辅音整音（如 `a` / `o`）是否单独产一条。默认关闭。
+
+#### 最大CV别名数
+
+同名 CV 别名的最大条目数，`0` = 不限。
+
+分类下受限制的条目：
+
+- 开头音（所有音频的 `-` 前缀条目）
+- 首音节的字内衔接
+
+> 注意：字内衔接的首 / 非首会按音节位置分到不同桶里。
+
+#### 最大VC别名数
+
+同名 VC 别名的最大条目数，`0` = 不限。
+
+分类下受限制的条目：
+
+- 非首音节的字内衔接
+- 跨音节 cV（`{front} {辅音}`）
+- 跨音节 cO（`{front} {整音}`）
+
+coda R 通过 `_bootstrap_missing_aliases` 补产，不经 `add_entry`，所以不受此上限控制。
+
+#### 重复别名策略
+
+| 选项 | 含义 |
+|---|---|
+| 替换已有同别名条目 | 新条目替换旧条目 |
+| 强制后备别名 | 加 `#1` / `#2` 后缀 |
+
+#### oto 排序（无模板时）
+
+| 选项 | 含义 |
+|---|---|
+| 自然排序 | 按 filename + offset |
+| 分类排序 | 按别名类别（开头 / 整音 / 字内衔接 / 跨音节 / coda R） |
+
+#### 确保所有音频至少一条 oto
+
+有模板时自动关闭。
+
+#### NCV 模式
+
+开启后，跨音节衔接产 `{front} {下一整音}`（cO）而不是 `{front} {下一辅音}`（cV）。
+
+### 3.3 模板设置（仅在有模板路径时显示）
+
+#### 模板 oto
+
+模板文件路径。留空则走普通生成。
+
+#### 模板排序
+
+| 选项 | 含义 |
+|---|---|
+| 按模板顺序 | oto.ini 里的条目顺序完全按模板 |
+| 按发音分类排序 | 按 `oto 排序` 分类 |
+
+#### 模板对齐
+
+| 选项 | 含义 |
+|---|---|
+| 严格匹配 | 模板要求但本音频产不出 → 记 missing |
+| 自动模糊 | 本音频产不出 → 用 `forced_index` 强制补产（时间戳仍来自当前音频） |
+
+#### 模板机制说明
+
+- 模板是**白名单**：只有模板里出现的 `(filename, alias)` 才会被保留
+- 优先从生成侧正常产出的条目匹配（`full_index`）
+- 匹配不到时，`- X` 类别名从 `start_index` 借（处理非首音节开头音）
+- **自动模糊**模式下再从 `forced_index` 强制补产一份（当前音频按公式重算，时间戳正确）
+
+### 3.4 字内衔接参数
+
+两类字内衔接都遵循同一组字段顺序：
 
 ```
-Process():
-  1. 读取主音符、attr0、attr1
-  2. totalDuration = sum(notes[i].duration)
-  3. 查 scheme.ini 得到 currentRule
-  4. hasPrev / hasNext 判定
-  5. 开头音 → ProcessOnset
-     非开头 → ProcessContinuation
-  6. ProcessTransitions 放置过渡音素
-  7. 最后一个音 → ProcessEnding 加尾音到静音
+左边界 → 重叠 → 预发声 → 固定 → 右边界
 ```
 
-### 5.2 开头音 ProcessOnset
-
-优先级：
-
-1. **尝试 `- Prefix`（VC 音素）**
-   - `VC 长度 = avgMs = (vcVoice + mainVoice) / 2`
-     - `vcVoice = -Cutoff - Preutter`（VC 自身的预发声到右边界）
-     - `mainVoice = -Cutoff - Preutter`（Main 的预发声到右边界）
-   - VC 不超过自身真实长度 `vcVoice`
-   - `VC × consonantStretchRatio`（用户可调）
-   - 下限 20 tick
-   - → 加 `VC(position = -vcLength)` + `Main(position = 0)`
-
-2. **尝试 `- Main`（整音开头）**
-   - → 只加一个音素 `(position = 0)`，不再加 Main
-
-3. **回退**：只加 `Main(position = 0)`
-
-### 5.3 非开头音 ProcessContinuation
-
-**有 Prefix**：
-
-1. **ncv 优先**：`"prevEnding Main"`（如 `"n~ zA"`）
-   - 若命中，只加这一个音素 `(position = 0)`，取代 VC + Main，直接 `return`
-2. **候选链**：`"prevEnding Prefix"` → `"Prefix"` → `"Main"`
-   - `VC 长度 = ComputeVcLength()`（基于 Main 的 Preutter）
-   - 平均法：`vcLength = (vcLength + prevEndVoice - prevOverlap) * 2/3`
-   - 上限：`prevSpan / 3`（`prevSpan = max(前音符 duration, 时间跨度)`）
-   - 空隙避让：若 `gap > 0`，`vcLength = min(vcLength, gap)`
-   - 下限：10 tick
-   - → 加 `VC(position = -vcLength)` + `Main(position = 0)`
-
-**无 Prefix**：
-
-- 候选链：`"prevEnding Main"` → `"Main"`
-- → 加连接别名或 `Main(position = 0)`
-
-### 5.4 过渡音素 ProcessTransitions
-
-步骤：
-
-1. 收集有效的过渡音素（必须存在于声库）
-2. 计算 `endingReserve`（尾音预留空间）
-3. 计算 `mainRaw`：
-   - **若 Main 以 `_` 结尾（固定）**：
-     - `a = Preutter(Main)`
-     - `b = Preutter(下一个介母衔接部)`
-     - `mo = min(Overlap(介母), b)` — 溢出红线的不算
-     - `mainRaw = (a + b - mo) / 2`
-     - `mainRaw = clamp(mainRaw, max(20, T/10), T/3)`
-   - **若 Main 不以 `_` 结尾（拉伸）**：
-     - `mainRaw = GetVoiceLength(Main)` — 用于总和计算，不固定位置
-4. 计算固定部总和 `fixedSum` 和拉伸部总和 `stretchSum`
-5. 分配实际时长（两级优先，见 5.5）
-6. 从右往左布局：先放 ending，再倒序放固定音素
-7. 拉伸音素自动落在相邻锚点之间
-
-### 5.5 缩短/拉长的分配策略
-
-设：
-
-- `fixedSum` = 所有固定音素的原生时长之和
-- `stretchSum` = 所有拉伸音素的原生时长之和
-- `minVowelSpace = max(60, totalDuration / 5)`
-
-**分支 1：`totalDuration >= fixedSum + minVowelSpace`（空间充足）**
-
-- 固定音素保持原生时长
-- 介母（拉伸）按期望值 `Preutter(自身)` 分配
-- main（拉伸）吸收剩余
-- → 元音自由伸缩，辅音不动
-
-**分支 2：`totalDuration < fixedSum + minVowelSpace`（空间紧张）**
-
-- 所有音素（含固定）按 `totalDuration / (fixedSum + stretchSum)` 等比缩
-- → 元音、辅音一起缩，避免单一音素挤压其它
-
-### 5.6 尾音到静音 ProcessEnding
-
-- **条件**：无下一个音符 且 `rule.Ending` 非空
-- **音素**：`"Ending R"` 优先，找不到用 `"Ending -"`
-- **长度**：`min(totalDuration / 6, 60)`
-- **位置**：`totalDuration - endingLength`
-
-### 5.7 介母布局
-
-- 介母（以 `_` 结尾的过渡音素）起点 = `mainRaw`
-- 即紧贴 main 右边缘，不再从右边缘往回推
-- 若越过下一锚点，限制到 `nextAnchor - 10`
-
-### 5.8 main 保底
-
-- `minMain = max(20, totalDuration / 10)`
-- `mainRaw` 计算结果 clamp 到 `[minMain, totalDuration / 3]`
-- 从右往左布局时 `cursor` 不许低于 `minMain`
-- 防止韵尾 / ending 吞掉整音
-
----
-
-## 六、G2P（汉字转拼音）
-
-### 6.1 触发时机
-
-OpenUtau 在渲染前调用 `SetUp()` 一次：
-
-1. 收集所有音符的主歌词
-2. 调用 `Romanize()` 批量转换
-3. 通过 `ChangeLyric()` 把拼音写回 `lyrics`
-
-之后 `Process()` 拿到的 `lyric` 已是拼音。
-
-### 6.2 普通话版
-
-```csharp
-protected virtual string[] Romanize(IEnumerable<string> lyrics)
-{
-    return BaseChinesePhonemizer.Romanize(lyrics);
-}
-```
-
-- 使用 `OpenUtau.Core` 内置字典
-- 输出无声调拼音（如 `"ni"`、`"hao"`）
-- 支持简体 + 繁体汉字
-
-### 6.3 粤语版
-
-```csharp
-protected virtual string[] Romanize(IEnumerable<string> lyrics)
-{
-    return Pinyin.Jyutping.Instance.HanziToPinyin(
-        lyrics.ToList(),
-        Pinyin.CanTone.Style.NORMAL,
-        Pinyin.Error.Default
-    ).Select(res => res.pinyin).ToArray();
-}
-```
-
-- 使用 Pinyin 库的 Jyutping 转换器
-- 输出无声调粤拼（如 `"nei"`、`"hou"`）
-- 支持简体 + 繁体汉字
-
-### 6.4 注意事项
-
-- `scheme.ini` 的键必须与 G2P 输出一致（无声调）
-- 若 G2P 抛异常，音素器会回退到把汉字当音素名直接发送
-
----
-
-## 七、参数与属性
-
-### 7.1 音符属性 attr0 / attr1
-
-从 `note.phonemeAttributes` 读取，`index` 区分：
-
-- `index 0` → 主音素（`voiceColor`、`toneShift`、`alternate`）
-- `index 1` → 辅音（`consonantStretchRatio`、`voiceColor`）
-
-**字段**：
+字段含义：
 
 | 字段 | 说明 |
-|------|------|
-| `voiceColor` | 音色后缀（如 `"Soft"`），会附加到音素名 |
-| `toneShift` | 音高偏移 |
-| `alternate` | 替代音源编号 |
-| `consonantStretchRatio` | 辅音拉伸倍率（仅对 VC 开头音生效） |
+|---|---|
+| 左边界 | 公式的起始位置 |
+| 重叠 | 左边界 → 预发声之间偏右的比例 |
+| 预发声 | 预先发声位置；不同类型有不同定位 |
+| 固定 | 预发声 → 右边界之间偏左的比例 |
+| 右边界 | 公式的终止位置 |
 
-### 7.2 音色后缀 AppendVoiceColor
+#### 类型 A：介母→主元音（四段式第一段）
 
-规则：
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界 | 固定为元音起点（用户不可调） | — |
+| 重叠 | 左边界 → 预发声之间偏右 | 100%（与预发声重合） |
+| 预发声 | 元音起点 + 元音时长 × `boundary_pct`（介母 / 主元音分界点） | 15% |
+| 固定 | 预发声 → 右边界之间偏左 | 30% |
+| 右边界 | 有独立韵尾段 → 韵尾起点；无独立韵尾段 → 元音起点 + 元音时长 × `right_pct` | 65% |
 
-- 若音素名已以 `" <color>"` 结尾，不重复添加
-- 否则追加 `" <color>"`
+#### 类型 B：主元音→韵尾（三段式 + 四段式第二段通用）
 
----
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界 | 元音起点 → 预发声之间偏右 | 65% |
+| 重叠 | 左边界 → 预发声之间偏右 | 50% |
+| 预发声 | 有独立韵尾段 → 韵尾起点；无独立韵尾段 → 元音起点 + 元音时长 × `assumed_pct`（假定韵尾起点） | 75% |
+| 固定 | 预发声 → 右边界之间偏左 | 30% |
+| 右边界 | 有独立韵尾段 → 韵尾结束；无独立韵尾段 → 元音结束 | — |
 
-## 八、常见问题排查
+#### 元音区
 
-**[Q1] 输入汉字没反应**
+对于 `yuan` 这类被 JSON 切成 `y0 + van` 两段的音节，字内衔接公式会把两段合并为一个"元音区"使用，即：
 
-A：检查是否有 `using OpenUtau.Core;`（普通话）或 `using Pinyin;`（粤语），`scheme.ini` 键是否为无声调。
+```
+v_zone_start = 元音段起点
+v_zone_end   = 韵尾段结束
+```
 
-**[Q2] 音素器不显示在列表**
+### 3.5 其它字内参数
+
+以下参数组也都遵循"左边界 → 重叠 → 预发声 → 固定 → 右边界"的语义顺序；预发声字段名按类型不同而不同。
+
+#### 开头辅音
+
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界向左偏移 | offset 相对辅音起点的左移量（超出音频头取头） | 75ms |
+| 预发声 | 辅音起点（固定） | — |
+| 固定 | — | 30% |
+| 重叠 | — | 30% |
+
+#### 整音-无介母
+
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界 | 辅音起点（无辅音时 = 元音起点） | — |
+| 预发声 | 元音起点 | — |
+| 右边界 | 元音段起点 → 结束之间偏右 | 65% |
+| 固定 | — | 30% |
+| 重叠 | — | 30% |
+
+#### 整音-有介母
+
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界 | 辅音起点（无辅音时 = 元音起点） | — |
+| 预发声 | 元音起点 | — |
+| 右边界 | 元音段前 15%，即介母 / 主元音分界点 | 15% |
+| 固定 | — | 30% |
+| 重叠 | — | 30% |
+
+#### 开头纯元音
+
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界向左偏移 | — | 75ms |
+| 预发声 | 元音起点 | — |
+| 右边界 | 元音段起点 → 结束之间偏右 | 65% |
+| 固定 | — | 15% |
+| 重叠 | — | 30% |
+
+#### 非开头纯元音
+
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界 | 元音起点 | — |
+| 预发声 | 元音起点 → 右边界之间偏右 | 15% |
+| 右边界 | 元音段起点 → 结束之间偏右 | 65% |
+| 固定 | — | 15% |
+| 重叠 | — | 30% |
+
+#### coda R
+
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界 | 韵尾段（或元音段）起点 → 结束之间偏右 | 75% |
+| 预发声 | 韵尾段（或元音段）终点 | — |
+| 右边界 | 预发声 + 右偏移（超出音频尾取尾） | 150ms |
+| 固定 | — | 30% |
+| 重叠位置 | — | 50% |
+
+#### 元音→辅音（跨音节）
+
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界 | 韵尾段（或元音段）起点 → 结束之间偏右 | 65% |
+| 预发声 | 韵尾段（或元音段）终点 | — |
+| 右边界 | 下一辅音中点 | — |
+| 固定 | — | 30% |
+| 重叠 | — | 30% |
+
+#### 元音→整音（跨音节）
+
+| 字段 | 定位 | 默认 |
+|---|---|---|
+| 左边界 | 韵尾段（或元音段）起点 → 结束之间偏右 | 65% |
+| 预发声 | 下一元音起点 | — |
+| 右边界 | 下一元音段起点 → 结束之间偏右 | 65% |
+| 固定 | — | 30% |
+| 重叠 | — | 30% |
+
+## 四、代码改动
+
+### 4.1 新增文件
+
+| 文件 | 功能 |
+|---|---|
+| `json2oto/json2cvvnc_oto.py` | 核心生成逻辑（约 1400 行） |
+| `cvvnc_panel.py` | CVNC/CVVNC/NCV 方案面板（`ScrolledPanel`） |
+| `cvvnc_params_panel.py` | 参数面板（子 Notebook） |
+
+### 4.2 修改文件
+
+`GUI.py` 中新增：
+
+- 顶部 `from cvvnc_panel import CvvncPanel`
+- `mark_notebook` 中新增 CVNC 页面（第四个 tab）
+- 新增 `on_generate_cvvnc_oto` 方法（约 150 行）
+
+### 4.3 核心逻辑说明
+
+`json2cvvnc_oto.py` 的主要结构：
+
+1. **`parse_rule_file`** — 解析 RULE，每个音节得到 `{consonant, onset, transitions, coda}`
+2. **`_scan_syllable_phones_by_word`** — 从 `word_phone.json` 读音节时间戳，把 `ds_phone_filter.json` 的 phone 段按重叠率 ≥ 50% 归属给每个音节
+3. **`_has_mediant_in_rule` / `_decide_mode`** — 判定音节走两段式 / 三段式 / 四段式
+4. **`_calc_*`** — 各类型字内 / 跨音节衔接的公式（`_calc_trans_a`、`_calc_trans_b`、`_calc_cV`、`_calc_cO`、`_calc_coda_r` 等）
+5. **`generate_oto`** — 主生成循环，逐音节产出条目；同时记录 `full_index`（生成侧正常产出的全量索引）
+6. **`_build_full_index`** — 无条件扫一遍所有音频，产两份索引：
+   - `full_index_extra`：按 `_decide_mode` 产
+   - `forced_index`：不看模式，RULE 声明了 transition / 下一音节是整音就产
+7. **`apply_template_with_offset`** — 模板作为白名单 + 顺序，三级匹配：`full_index → start_index → forced_index`
+8. **`sort_oto_entries`** — 自然 / 分类 / 模板顺序三种排序
+9. **`run`** — 入口，串联全流程
+
+### 4.4 主要设计决策
+
+- 不用文本匹配切音节，全部靠时间戳（`word_phone` 提供的 `[xmin, xmax]`）→ 符号不一致也能正确归属
+- 字内衔接基于"元音区"（`vowel_p + coda_p` 合并），不依赖 JSON 是否切出独立韵尾段
+- NCV 模式可切换：关闭走传统 cV（到辅音），开启走 cO（到整音）
+- 模板只做白名单 + 顺序，时间戳始终来自当前音频，不跨音频搬运
+
+## 五、常见问题
+
+**Q：为什么 `er` / `ai` / `an` 这类音节有字内衔接？**
+
+A：RULE 声明了 transition，且 coda 带 `~`。JSON 未切出独立韵尾时用"假定韵尾起点"估算位置。
+
+**Q：为什么生成的条目比模板少 / 多？**
+
+A：模板是白名单，模板没列的一律丢弃。条目少通常是因为生成侧没产出对应别名——看结果窗口里的"模板中生成侧未算出的条目"清单。
+
+**Q：NCV 模式下为什么看不到到辅音的别名（如 `a b`）？**
+
+A：NCV 模式设计上就不产 cV，只产 cO（`a ba`）。关闭 NCV 模式即可恢复。
+
+**Q：模板设置里的"严格匹配"和"自动模糊"有什么区别？**
+
+A：严格匹配只从生成侧正常产出里找；自动模糊会额外启用 `forced_index`，把 RULE 声明了但 JSON 未切出独立段的情况也按公式强制补产一份。
+
+**Q：最大 CV / VC 别名数是怎么分类的？**
 
 A：
 
-- 检查 `[Phonemizer]` 特性 Tag 是否唯一
-- DLL 是否放在 `Plugins\` 目录
-- 目标框架是否与 OpenUtau 运行时一致
-
-**[Q3] 辅音太长挤掉元音**
-
-A：检查 `ProcessContinuation` 里的碰撞检测是否生效，`ComputeVcLength` 里不应有 `totalDuration / 3` 上限。
-
-**[Q4] 短音时辅音听不清**
-
-A：确认使用了两级优先策略（方案 C）。极限短音下辅音会被压缩，这是不可避免的。
-
-**[Q5] 长音时介母被拉伸过长**
-
-A：介母起点紧贴 main 右边缘（= `mainRaw`），不再从右边缘回推。`mainRaw` 使用 `(Preutter(main) + Preutter(med) - min(Overlap, Preutter)) / 2`。
-
-**[Q6] `+` 连音被当独立音符**
-
-A：OpenUtau 已自动合并入 `notes[]`，代码里 `totalDuration` 就是合并后的总时长，无需额外处理。若 `lyric == "+"` 出现在 `notes[0]`，说明是孤立 `+`，建议返回 `MakeSimpleResult("-", attr0)`。
-
----
-
-## 九、开发历程与关键决策
-
-**阶段 1：初版**
-
-- 失败：`SetUp` 里手动合并 `+` 到前音符，与 OpenUtau 架构冲突
-- 失败：空音符数组返回导致渲染崩溃
-
-**阶段 2：重构**
-
-- 删除 `SetUp` 里的合并逻辑，改为信任 `notes[]` 数组
-- 孤立 `+` 返回静音占位符
-
-**阶段 3：拉伸/固定分离**
-
-- 引入以 `_` 结尾 / 开头判断
-- 从右往左布局固定音素
-
-**阶段 4：oto 参考字段迭代**
-
-- 试过 `Consonant`、`Preutter`、`-Cutoff-Preutter`、平均值、`max(Preutter, Overlap)`
-- 最终：main 用 `(Preutter(main) + Preutter(med) - min(Overlap, Preutter(med))) / 2`
-- 韵尾用 `Preutter`
-- 介母用 `Preutter`
-
-**阶段 5：缩短策略迭代**
-
-- 失败 1：全部等比缩 → 辅音听不清
-- 失败 2：拉伸先缩到 20% → 元音被压没
-- 失败 3：`T >= fixedSum` 判定 → 韵尾挤压 main
-- 最终：`T >= fixedSum + minVowelSpace` 才走"固定不动"，否则所有音素整体等比缩
-
-**阶段 6：长度限制**
-
-- 开头 VC 不超过自身真实长度，且与 main 取平均
-- 中间 VC 有平均法 + `prevSpan/3` 上限 + 空隙避让 + 下限 10
-- main 有 `minMain = max(20, T/10)` 保底
-
----
-
-## 十、代码结构导航
-
-**类**：
-
-- `ZHCVnCCvVnCPhonemizer`（普通话版）
-- `ZHYUECVnCCvVnCPhonemizer`（粤语版，结构完全相同）
-
-以下是两者共有的成员（粤语版多一个 Pinyin 引用）：
-
-| 成员 | 说明 |
-|------|------|
-| `SetSinger()` | 加载 `scheme.ini` |
-| `LoadSchemeFile()` | 解析规则文件 |
-| `ParseRuleString()` | 处理带引号的规则串 |
-| `Romanize()` | [虚拟] G2P 转换 |
-| `ChangeLyric()` | 写回拼音 |
-| `SetUp()` | 批量 G2P 入口 |
-| `Process()` | 主入口 |
-| `ProcessOnset()` | 开头音 |
-| `ProcessContinuation()` | 非开头音 |
-| `ComputeVcLength()` | VC 长度计算 |
-| `GetVoiceLength()` | `-Cutoff - Preutter` |
-| `GetFixedDuration()` | `(voiceLen + consonant) / 2` |
-| `ResolveAlias()` | 音素别名解析 |
-| `ProcessTransitions()` | 过渡音素布局 |
-| `ProcessEnding()` | 尾音到静音 |
-| `GetAttr()` | 读取音符属性 |
-| `AddMainPhoneme()` | 添加主音素 |
-| `CheckOtoUntilHit()` | 依次尝试候选别名 |
-| `CheckOtoExists()` | 单音素存在性检查 |
-| `AppendVoiceColor()` | 音色后缀 |
-| `MakeSimpleResult()` | 快捷返回 |
-| `CVnCRule` | 规则数据结构 |
-
-**字段**：
-
-| 字段 | 说明 |
-|------|------|
-| `singer` | `USinger` 实例 |
-| `rules` | `Dictionary<string, CVnCRule>` |
-
----
-
-*文档结束*
+- 受"最大CV别名数"限制的：开头音（所有音频的 `-` 前缀条目）、首音节的字内衔接
+- 受"最大VC别名数"限制的：非首音节的字内衔接、跨音节 cV / cO
+- coda R 通过 `_bootstrap_missing_aliases` 补产，不经 `add_entry`，不受这两个上限控制
+```

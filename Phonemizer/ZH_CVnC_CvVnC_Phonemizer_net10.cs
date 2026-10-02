@@ -5,11 +5,10 @@ using System.Linq;
 using OpenUtau.Api;
 using OpenUtau.Core.Ustx;
 using Serilog;
-using Pinyin;
 namespace OpenUtau.Core
 {
-    [Phonemizer("ZH YUE CVnC/CvVnC Phonemizer", "ZH YUE CVnC/CvVnC", language: "ZH-YUE")]
-    public class ZHYUECVnCCvVnCPhonemizer : Phonemizer
+    [Phonemizer("ZH CVnC/CvVnC Phonemizer", "ZH CVnC/CvVnC", language: "ZH")]
+    public class ZHCVnCCvVnCPhonemizer : Phonemizer
     {
         private USinger? singer;
         private readonly Dictionary<string, CVnCRule> rules = new();
@@ -141,11 +140,7 @@ namespace OpenUtau.Core
 
         protected virtual string[] Romanize(IEnumerable<string> lyrics)
         {
-            return Pinyin.Jyutping.Instance.HanziToPinyin(
-                lyrics.ToList(),
-                Pinyin.CanTone.Style.NORMAL,
-                Pinyin.Error.Default
-            ).Select(res => res.pinyin).ToArray();
+            return BaseChinesePhonemizer.Romanize(lyrics);
         }
 
         public static Note[] ChangeLyric(Note[] group, string lyric)
@@ -295,7 +290,7 @@ namespace OpenUtau.Core
 
             if (!string.IsNullOrEmpty(rule.Prefix))
             {
-                // ncv 优先
+                // ncv 优先（前尾音 + 当前整音，如 "n~ zA"）
                 if (!string.IsNullOrEmpty(prevEnding))
                 {
                     var ncvCandidates = new List<string> { $"{prevEnding} {rule.Main}" };
@@ -309,7 +304,6 @@ namespace OpenUtau.Core
                         return;
                     }
                 }
-
                 // 有辅音： "prevEnding prefix" -> "prefix" -> "main"
                 var candidates = new List<string>();
                 if (!string.IsNullOrEmpty(prevEnding))
@@ -324,7 +318,7 @@ namespace OpenUtau.Core
                     int vcLength = ComputeVcLength(rule.Main, note, attr, totalDuration, endTick);
 
                     if (!string.IsNullOrEmpty(prevEnding) && singer != null &&
-                           singer.TryGetMappedOto(prevEnding, note.tone + attr.toneShift, attr.voiceColor, out var prevEndOto))
+                           singer.TryGetMappedOto(prevEnding, note.tone + (attr.toneShift ?? 0), attr.voiceColor, out var prevEndOto))
                     {
                         int prevEndVoice = (int)(-prevEndOto.Cutoff - prevEndOto.Preutter);
                         int prevOverlap = (int)prevEndOto.Overlap;
@@ -365,7 +359,7 @@ namespace OpenUtau.Core
                         phoneme = AppendVoiceColor(vcOto.Alias, attr),
                         position = -vcLength,
                     });
-                }
+                }   
 
                 AddMainPhoneme(phonemes, rule.Main, note, attr, 0);   // ← 在 if 外面
             }
@@ -398,7 +392,7 @@ namespace OpenUtau.Core
         private int ComputeVcLength(string mainPhoneme, Note note, PhonemeAttributes attr, int totalDuration, int endTick)
         {
             if (singer != null &&
-                singer.TryGetMappedOto(mainPhoneme, note.tone + attr.toneShift, attr.voiceColor, out var oto))
+                singer.TryGetMappedOto(mainPhoneme, note.tone + (attr.toneShift ?? 0), attr.voiceColor, out var oto))
             {
                 int vcLength = -timeAxis.MsToTickAt(-oto.Preutter, endTick);
                 return Math.Max(30, vcLength);   // 不再被 T/3 砍
@@ -410,7 +404,7 @@ namespace OpenUtau.Core
         private int GetVoiceLength(string phoneme, Note note, PhonemeAttributes attr)
         {
             if (singer != null &&
-                singer.TryGetMappedOto(phoneme, note.tone + attr.toneShift, attr.voiceColor, out var oto))
+                singer.TryGetMappedOto(phoneme, note.tone + (attr.toneShift ?? 0), attr.voiceColor, out var oto))
             {
                 int dur = (int)(-oto.Cutoff - oto.Preutter);   // ← 改这里
                 if (dur <= 0) dur = 60;
@@ -418,11 +412,10 @@ namespace OpenUtau.Core
             }
             return 60;
         }
-
         private int GetFixedDuration(string phoneme, Note note, PhonemeAttributes attr)
         {
             if (singer != null &&
-                singer.TryGetMappedOto(phoneme, note.tone + attr.toneShift, attr.voiceColor, out var oto))
+                singer.TryGetMappedOto(phoneme, note.tone + (attr.toneShift ?? 0), attr.voiceColor, out var oto))
             {
                 int voiceLen = (int)(-oto.Cutoff - oto.Preutter);
                 int consonant = (int)oto.Consonant;
@@ -446,7 +439,7 @@ namespace OpenUtau.Core
         private string ResolveAlias(string phoneme, Note note, PhonemeAttributes attr)
         {
             if (singer != null &&
-                singer.TryGetMappedOto(phoneme, note.tone + attr.toneShift, attr.voiceColor, out var oto))
+                singer.TryGetMappedOto(phoneme, note.tone + (attr.toneShift ?? 0), attr.voiceColor, out var oto))
             {
                 return oto.Alias;
             }
@@ -489,7 +482,7 @@ namespace OpenUtau.Core
                 // a = main 自己的 Preutter
                 int a = 0;
                 if (singer != null && singer.TryGetMappedOto(rule.Main,
-                        note.tone + attr.toneShift, attr.voiceColor, out var mainOto))
+                        note.tone + (attr.toneShift ?? 0), attr.voiceColor, out var mainOto))
                 {
                     a = (int)mainOto.Preutter;
                     if (a < 0) a = 0;
@@ -506,7 +499,7 @@ namespace OpenUtau.Core
                         if (!CheckOtoExists(t, note.tone, attr)
                             && !CheckOtoUntilHit(new List<string> { t }, note, attr, out _)) continue;
 
-                        if (singer.TryGetMappedOto(t, note.tone + attr.toneShift, attr.voiceColor, out var otoM))
+                        if (singer.TryGetMappedOto(t, note.tone + (attr.toneShift ?? 0), attr.voiceColor, out var otoM))
                         {
                             b = (int)otoM.Preutter;
                             if (b < 0) b = 0;
@@ -540,7 +533,7 @@ namespace OpenUtau.Core
                 if (!transitions[i].isMedial) continue;
 
                 if (singer != null && singer.TryGetMappedOto(transitions[i].resolved,
-                        note.tone + attr.toneShift, attr.voiceColor, out var otoSelf))
+                        note.tone + (attr.toneShift ?? 0), attr.voiceColor, out var otoSelf))
                 {
                     int pre = (int)otoSelf.Preutter;
                     int ov = (int)otoSelf.Overlap;
@@ -575,7 +568,6 @@ namespace OpenUtau.Core
 
             if (totalDuration >= fixedSum + minVowelSpace)
             {
-                // ---- 空间够：固定部不动，拉伸部按期望时长分配 ----
                 // ---- 空间够：固定部不动，拉伸部按期望时长分配 ----
                 int remaining = totalDuration - fixedSum;
                 int perStretch = stretchCount > 0 ? Math.Max(1, remaining / stretchCount) : 0;
@@ -612,7 +604,7 @@ namespace OpenUtau.Core
                 }
             }
 
-            // 6. 从右往左布局
+            // 6. 从右往左布局（固定部先占位）
             int minMain2 = Math.Max(20, totalDuration / 10);
             int cursor = totalDuration - actualEnding;
             if (cursor < 0) cursor = 0;
@@ -747,7 +739,7 @@ namespace OpenUtau.Core
                     continue;
                 }
 
-                if (singer.TryGetMappedOto(test, note.tone + attr.toneShift, attr.voiceColor, out var result))
+                if (singer.TryGetMappedOto(test, note.tone + (attr.toneShift ?? 0), attr.voiceColor, out var result))
                 {
                     oto = result;
                     return true;
@@ -763,7 +755,7 @@ namespace OpenUtau.Core
             {
                 return false;
             }
-            return singer.TryGetMappedOto(phoneme, tone + attr.toneShift, attr.voiceColor, out _);
+            return singer.TryGetMappedOto(phoneme, tone + (attr.toneShift ?? 0), attr.voiceColor, out _);
         }
 
         private static string AppendVoiceColor(string phoneme, PhonemeAttributes attr)
