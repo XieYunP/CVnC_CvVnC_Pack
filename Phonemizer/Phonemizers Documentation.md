@@ -165,6 +165,7 @@ OpenUtau 会把一个主音符以及它后面连续的 `+` 延音合并成一个
 
 - `voiceLen = (-Cutoff) - Preutter` — 预发声到右边界长度
 - `consonant = Consonant` — 辅音物理长度
+- `medialLen = (-Cutoff) - Preutter` — 对 `_` 结尾的 Main 而言，代表它采样里"介母段"的长度
 
 ### 4.4 toneShift 类型差异
 
@@ -236,58 +237,70 @@ Process():
 步骤：
 
 1. **收集有效过渡音素**（必须存在于声库）
-   - 以 `_` 结尾且不以 `_` 开头 → 介母衔接部（拉伸）
+   - 以 `_` 结尾且不以 `_` 开头 → 介母衔接部
    - 以 `_` 开头 → 韵尾衔接部（固定）
 
 2. **尾音预留**：`endingReserve = min(T/6, 60)`，最小 20
 
 3. **计算 mainRaw**：
-   - **若 Main 以 `_` 结尾（固定）**：
-     - `a = Preutter(Main)`
-     - `b = Preutter(下一个介母衔接部)`
-     - `mainRaw = min(a, b)` ← 取最短，避免前后速度突变
+   - **若 Main 以 `_` 结尾（固定，如 `ji_`）**：
+     - `a = -Cutoff(Main) - Preutter(Main)` ← Main 采样里介母部分的长度
+     - `b = Preutter(下一个介母衔接部)` ← med 采样里介母部分的长度
+     - `mainRaw = (a + b) / 2` ← 平均法，两者物理对等
      - 若 a、b 都取不到，回退 `voiceLen(Main)`
-     - clamp 到 `[max(20, T/10), T/3]`
-   - **若 Main 不以 `_` 结尾（拉伸）**：
-     - `mainRaw = voiceLen(Main)`
-     - clamp 到 `[max(20, T/10), T/3]`
+     - 下限：`if (mainRaw < 20) mainRaw = 20`
+   - **若 Main 不以 `_` 结尾（拉伸，如 `gO`）**：
+     - `mainRaw = voiceLen(Main)` ← 供总和估算，不固定位置
+     - 下限：`if (mainRaw < 20) mainRaw = 20`
 
 4. **计算介母期望时长** `medialExpected`：
    - 每个介母 = `max(Preutter, Overlap)`，最小 20
 
-5. **计算固定部总和** `fixedSum` 和 **拉伸部总和** `stretchSum`
+5. **计算所需总时长**：
+   - `fixedSum = endingReserve + mainRaw（若 main 固定）+ 所有韵尾 rawDur`
+   - `stretchSum = mainRaw（若 main 拉伸）+ 所有介母 medialExpected`
+   - `totalNeeded = fixedSum + stretchSum`
+   - `scale = min(1, T / totalNeeded)`
 
-6. **分配实际时长**（两级优先，见 5.5）
+6. **应用 scale**：
+   - `actualMain = mainRaw × scale`（仅当 main 固定；拉伸型 main 不主动缩）
+   - `actualEnding = endingReserve × scale`
+   - `actualTrans[i] = rawDur 或 medialExpected × scale`
 
-7. **从右往左布局**：
-   - `minMain2 = max(20, T/10)`
-   - `cursor = totalDuration - actualEnding`
-   - 倒序放固定音素，`cursor` 不低于 `minMain2`
+7. **布局**：
+   - **6a. 从右往左排韵尾（非介母）**：
+     - `cursor = T - actualEnding`
+     - 倒序遍历，跳过介母，依次 `cursor -= actualTrans[i]`
+     - 下限 0，记录 `positions[i]`，`placed[i] = true`
+   - **6b. 介母紧贴 main 右边缘，占据剩余空间**：
+     - `newPos = actualMain`
+     - 下一锚点 = 后面第一个 `placed[j]` 的 `positions[j]`（若无则 `T - actualEnding`）
+     - 若 `newPos ≥ nextAnchor`，限制到 `nextAnchor - 10`
+     - `positions[i] = newPos`，`placed[i] = true`
 
-8. **介母布局**（见 5.7）
+8. 添加音素
 
-9. 添加音素
-
-### 5.5 缩短/拉长的分配策略
+### 5.5 时长分配策略
 
 设：
 
-- `fixedSum` = 所有固定音素的原生时长之和
-- `stretchSum` = 所有拉伸音素的原生时长之和
-- `minVowelSpace = max(60, totalDuration / 5)`
+- `fixedSum = endingReserve + mainRaw（若 main 固定）+ 所有韵尾 rawDur`
+- `stretchSum = mainRaw（若 main 拉伸）+ 所有介母 medialExpected`
+- `totalNeeded = fixedSum + stretchSum`
 
-**分支 1：`totalDuration >= fixedSum + minVowelSpace`（空间充足）**
+**统一缩放**：
 
-- 固定音素保持原生时长
-- 介母按 `medialExpected` 分配
-- main 吸收剩余空间
-- → 元音自由伸缩，辅音不动
+- 若 `totalDuration >= totalNeeded`：`scale = 1`，各音素保持原时长
+- 若 `totalDuration < totalNeeded`：`scale = totalDuration / totalNeeded`，所有音素等比缩
 
-**分支 2：`totalDuration < fixedSum + minVowelSpace`（空间紧张）**
+**应用**：
 
-- `scale = totalDuration / (fixedSum + stretchSum)`
-- 所有音素（含 `mainRaw`、`endingReserve`、各过渡音素）乘以 `scale`
-- → 全音符等比缩，保证总和 = `totalDuration`，不溢出
+- `actualMain = mainRaw × scale`（仅当 main 固定；拉伸型 main 不主动缩，由布局自动处理）
+- `actualEnding = endingReserve × scale`
+- `actualTrans[i] = rawDur 或 medialExpected × scale`
+- 结果：所有部分的视觉总和 ≤ `totalDuration`，不溢出
+
+**注**：main 固定时，其视觉长度在布局阶段会被"拉伸"到介母起点（6b），这是引擎采样尾部填充的结果，视觉表现符合"元音拉伸"。
 
 ### 5.6 尾音到静音 ProcessEnding
 
@@ -305,12 +318,12 @@ Process():
 - 若起点越过下一锚点，限制到 `nextAnchor − 10`
 - **目的**：遇到介母就固定起点，遇到元音就让元音拉伸
 
-### 5.8 main 保底
+### 5.8 main 下限
 
-- `minMain = max(20, totalDuration / 10)`
-- `mainRaw` 计算结果 clamp 到 `[minMain, totalDuration / 3]`
-- 从右往左布局时 `cursor` 不许低于 `minMain`
-- 防止韵尾 / ending 吞掉整音
+- 只有硬下限 `mainRaw = max(mainRaw, 20)`
+- 不再随 T 变（取消 `T/10` 和 `T/3` 的比例限制）
+- 目的：让固定音素真正"固定"，不被比例撑大
+- 布局 6a 的 `cursor` 最低可为 0，不再保留 `minMain` 区
 
 ---
 
@@ -411,15 +424,15 @@ A：检查 `ProcessContinuation` 里的碰撞检测是否生效。`ComputeVcLeng
 
 **[Q4] 短音时辅音听不清**
 
-A：确认 `ProcessTransitions` 第 5 步的两级优先策略生效。极限短音下所有音素等比缩，这是不可避免的。
+A：`ProcessTransitions` 第 5 步统一使用 `scale = min(1, T / totalNeeded)`，短音时所有音素等比缩。极限短音下音素被压缩，这是不可避免的。
 
 **[Q5] 长音时介母被拉伸过长**
 
-A：介母起点紧贴 main 右边缘（= `mainRaw`），不再从右边缘回推。`mainRaw` 使用 `min(Preutter(main), Preutter(med))`。
+A：介母起点紧贴 main 右边缘（= `mainRaw`），不再从右边缘回推。`mainRaw` 使用 `(a + b) / 2`，其中 `a = -Cutoff(main) - Preutter(main)`、`b = Preutter(med)`。
 
 **[Q6] 前后介母长度差太大导致听觉"加速"突兀**
 
-A：`mainRaw` 用 `min(a, b)` 取最短者，保证前后速度一致。
+A：`mainRaw` 用平均法，`a` 和 `b` 都是各自采样里介母段的物理长度，对等取平均。
 
 **[Q7] `+` 连音被当独立音符**
 
@@ -444,20 +457,24 @@ A：net8 的 `toneShift` 是 `int`，不能用 `(attr.toneShift ?? 0)`。用 **C
 - 从右往左布局固定音素，介母、韵尾、整音分别处理
 - oto 字段迭代：试过 `Consonant`、`Preutter`、`-Cutoff-Preutter`、平均值
 - 缩短策略迭代：失败过"全部等比缩"、"拉伸先缩 20%"、"T >= fixedSum 判定"
-- 长度限制：开头 VC 不超过自身真实长度；中间 VC 有平均法 + `prevSpan/3` 上限 + 空隙避让；main 有 `minMain = max(20, T/10)` 保底
+- 长度限制：开头 VC 不超过自身真实长度；中间 VC 有平均法 + `prevSpan/3` 上限 + 空隙避让
 
 **阶段 2：发布版本**
 
-在工程版本基础上修正与扩充，形成稳定发布版。
+在工程版本基础上重构、修正与扩充，形成稳定发布版。
 
-- **介母逻辑修正**：
-  - 问题：前后介母长度差太大，重叠处出现听觉"加速"突兀
-  - 改前：`mainRaw = (Preutter(main) + Preutter(med) - overlap) / 2`
-  - 改后：`mainRaw = min(Preutter(main), Preutter(med))`，取最短者
-  - 效果：前后介母速度一致，长音时 main 不突变
-- **缩短/拉长策略定稿**：
-  - `T >= fixedSum + minVowelSpace` 才走"固定不动"
-  - 否则所有音素整体等比缩，保证总和 = `totalDuration`
+- **过渡音素布局重构**：
+  - 原问题：介母、韵尾、main 混排，长音时 main 视觉被不合理撑大
+  - 重构：引入 `placed[]` 追踪已定位音素，拆成 6a（韵尾从右往左排）和 6b（介母紧贴 main 右边缘）
+  - 结果：main 视觉固定，介母占据剩余空间，元音在听感上拉伸
+- **main 固定时长定稿**：
+  - `a = -Cutoff(main) - Preutter(main)`（main 采样里介母部分的长度）
+  - `b = Preutter(med)`（med 采样里介母部分的长度）
+  - `mainRaw = (a + b) / 2`（两个物理对等的量取平均）
+  - 硬下限只有 20 tick，取消 `T/10`、`T/3` 比例限制
+- **时长分配定稿**：
+  - `scale = min(1, T / totalNeeded)`，所有音素统一等比缩
+  - 保证视觉总和 ≤ `totalDuration`
 - **介母期望时长定稿**：`max(Preutter, Overlap)`，最小 20
 - **net10 兼容版本**：
   - 背景：OpenUtau 主程序升级到 net10 后，旧 net8 插件无法加载
@@ -512,5 +529,3 @@ A：net8 的 `toneShift` 是 `int`，不能用 `(attr.toneShift ?? 0)`。用 **C
 ---
 
 *本文档及代码逻辑由 DeepSeek 辅助开发。*
-
-*文档结束*
