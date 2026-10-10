@@ -499,7 +499,14 @@ A：
 - **时长分配定稿**：
   - `scale = min(1, T / totalNeeded)`，所有音素统一等比缩
   - 保证视觉总和 ≤ `totalDuration`
-- **介母期望时长定稿**：`max(Preutter, Overlap)`，最小 20
+- **VC 长度算法定稿**：
+  - 原问题：`VC 长度 = Preutter(Main)`，预发声到采样起点那段元音被算进 VC 视觉宽度
+  - 修正：`VC 长度 = -Cutoff - Preutter`，即预发声点到采样右边界
+  - 语义：只覆盖辅音起始段，与前一音符尾音衔接处的元音不重复计算
+  - 上限：自身 `-Cutoff - Preutter`
+  - 效果：长辅音（如 `7 h`、`a y`）不再因为预发声长而视觉过长
+- **介母缩放权重定稿**：`max(Preutter, Overlap)`，最小 20
+  仅用于缩短时估算 `stretchSum`，不直接决定布局
 - **net10 兼容版本**：
   - 背景：OpenUtau 主程序升级到 net10 后，旧 net8 插件无法加载
   - 方案：新增 net10 目标框架的 csproj 副本，源码独立维护
