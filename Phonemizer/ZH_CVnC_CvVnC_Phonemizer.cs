@@ -315,7 +315,7 @@ namespace OpenUtau.Core
 
                 if (singer != null && CheckOtoUntilHit(candidates, note, attr, out var vcOto))
                 {
-                    int vcLength = ComputeVcLength(rule.Main, note, attr, totalDuration, endTick);
+                    int vcLength = ComputeVcLength(vcOto, endTick);
 
                     if (!string.IsNullOrEmpty(prevEnding) && singer != null &&
                            singer.TryGetMappedOto(prevEnding, note.tone + attr.toneShift, attr.voiceColor, out var prevEndOto))
@@ -347,10 +347,10 @@ namespace OpenUtau.Core
                             vcLength = Math.Min(vcLength, gap);
                         }
                         // gap <= 0 说明音符紧贴或重叠，不限制，让 OpenUtau 引擎自己处理
-                        // VC 上限 = 自身 Preutter
-                        int vcPre = (int)vcOto.Preutter;
-                        if (vcPre > 0 && vcLength > vcPre)
-                            vcLength = vcPre;
+                        // VC 上限 = 自身 Consonant
+                        int vcVoice = (int)(-vcOto.Cutoff - vcOto.Preutter);
+                        if (vcVoice > 0 && vcLength > vcVoice)
+                            vcLength = vcVoice;
                         if (vcLength < 10) vcLength = 10;
                     }
 
@@ -389,15 +389,13 @@ namespace OpenUtau.Core
         }
 
 
-        private int ComputeVcLength(string mainPhoneme, Note note, PhonemeAttributes attr, int totalDuration, int endTick)
+        private int ComputeVcLength(UOto oto, int endTick)
         {
-            if (singer != null &&
-                singer.TryGetMappedOto(mainPhoneme, note.tone + attr.toneShift, attr.voiceColor, out var oto))
-            {
-                int vcLength = -timeAxis.MsToTickAt(-oto.Preutter, endTick);
-                return Math.Max(30, vcLength);   // 不再被 T/3 砍
-            }
-            return 30;
+            // 从预发声点到右边界
+            double ms = -oto.Cutoff - oto.Preutter;
+            if (ms <= 0) ms = 60;
+            int vcLength = -timeAxis.MsToTickAt(-ms, endTick);
+            return Math.Max(30, vcLength);
         }
 
         // 预发声到右边界
