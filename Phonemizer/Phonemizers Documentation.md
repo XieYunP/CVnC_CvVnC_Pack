@@ -78,6 +78,8 @@
 
 **安装**：将编译好的 `.dll` 复制到 `OpenUtau安装目录\Plugins\` 后重启。
 
+**重要**：编译产物在 `bin\Debug\<框架>\`，**不是** `obj\...\ref\` 或 `obj\...\refint\` 里的。后者是引用程序集，OpenUtau 加载后会无响应。
+
 **注意**：net8 版与 net10 版的 `[Phonemizer]` Tag 相同，**同一个 OpenUtau 的 `Plugins\` 目录里只能放一个版本**，否则会冲突。
 
 ---
@@ -156,16 +158,15 @@ OpenUtau 会把一个主音符以及它后面连续的 `+` 延音合并成一个
 | 字段 | 说明 |
 |------|------|
 | `Offset` | 音频起点偏移 |
-| `Consonant` | 辅音时长（从音素起点到元音开始） |
+| `Consonant` | 辅音物理长度 |
 | `Cutoff` | 右边界（负值，从音频末端往前数的距离） |
-| `Preutter` | 预发声时长 |
+| `Preutter` | 预发声时长（辅音起点到元音起点） |
 | `Overlap` | 交叉淡入点 |
 
 **关键派生量**：
 
 - `voiceLen = (-Cutoff) - Preutter` — 预发声到右边界长度
 - `consonant = Consonant` — 辅音物理长度
-- `medialLen = (-Cutoff) - Preutter` — 对 `_` 结尾的 Main 而言，代表它采样里"介母段"的长度
 
 ### 4.4 toneShift 类型差异
 
@@ -201,7 +202,7 @@ Process():
 1. **尝试 `- Prefix`（VC 音素）**
    - `vcVoice = -Cutoff - Preutter`（VC 自身的预发声到右边界）
    - `mainVoice = -Cutoff - Preutter`（Main 的预发声到右边界）
-   - `avgMs = (vcVoice + mainVoice) / 2`，但 `avgMs` 不超过 `vcVoice`（自身真实长度）
+   - `avgMs = (vcVoice + mainVoice) / 2`，但 `avgMs` 不超过 `vcVoice`
    - `vcLength = MsToTick(avgMs) × consonantStretchRatio`（用户可调）
    - 下限 20 tick
    - → 加 `VC(position = -vcLength)` + `Main(position = 0)`
@@ -218,113 +219,198 @@ Process():
 1. **ncv 优先**：`"prevEnding Main"`（如 `"n~ zA"`）
    - 若命中，只加这一个音素 `(position = 0)`，取代 VC + Main，直接 `return`
 2. **候选链**：`"prevEnding Prefix"` → `"Prefix"` → `"Main"`
-   - `VC 长度 = ComputeVcLength()`
-     = `-Cutoff - Preutter`（预发声点到右边界），最小 30
-   - **平均法**：`vcLength = (vcLength + prevEndVoice - prevOverlap) * 2/3`
-   - **三重上限**（取最小）：
-     - `prevSpan / 3`（`prevSpan = max(前音符 duration, 时间跨度)`）
-     - 自身 `-Cutoff - Preutter`（`vcOto` 的预发声到右边界）
-     - 空隙 `gap`（若 `gap > 0`）
+   - `vcLength = ComputeVcLength()`（见 5.4）
+   - **软上限 1**（VC 自身物理辅音长度）：
+     `vcVoiceMax = -Cutoff(vc) - Preutter(vc)`
+     若 `vcLength > vcVoiceMax`，`vcLength = (vcLength + vcVoiceMax) / 2`
+   - **软上限 2**（不侵占前一个音符超过 1/3）：
+     `cap = gap + prevDur / 3 + mainOverlap`（`gap = max(0, noteStart - prevEnd)`，最小 20）
+     若 `vcLength > cap`，`vcLength = (vcLength + cap) / 2`
    - 下限：10 tick
-   - → 加 `VC(position = -vcLength)` + `Main(position = 0)`
+   - `vcPosition = -vcLength + mainOverlap`
+   - → 加 `VC(position = vcPosition)` + `Main(position = 0)`
+   - 输出诊断日志 `[VC]`
 
 **无 Prefix**：
 
 - 候选链：`"prevEnding Main"` → `"Main"`
 - → 加连接别名或 `Main(position = 0)`
 
-### 5.4 过渡音素 ProcessTransitions
+### 5.4 ComputeVcLength（VC 视觉长度）
 
-步骤：
+```csharp
+int vcVoice = -Cutoff(vc) - Preutter(vc);     // VC 自身辅音段
+int ovAbs   = |Overlap(main)|;                 // main 与 VC 的共享交叉段
+int pre     =  Preutter(main);                 // main 预发声到元音起点
 
-1. **收集有效过渡音素**（必须存在于声库）
-   - 以 `_` 结尾且不以 `_` 开头 → 介母衔接部
-   - 以 `_` 开头 → 韵尾衔接部（固定）
+int totalMs = (vcVoice + ovAbs) / 2 + pre;
+return max(30, MsToTick(totalMs));
+```
 
-2. **尾音预留**：`endingReserve = min(T/6, 60)`，最小 20
+语义：VC 视觉宽度 = "VC 辅音的物理长度与 main 交叉段的平均" + "main 预发声到元音起点"。前半段由 VC 决定，后半段由 main 决定，取一个折中值。
 
-3. **计算 mainRaw**：
-   - **若 Main 以 `_` 结尾（固定，如 `ji_`）**：
-     - `a = -Cutoff(Main) - Preutter(Main)` ← Main 采样里介母部分的长度
-     - `b = Preutter(下一个介母衔接部)` ← med 采样里介母部分的长度
-     - `mainRaw = (a + b) / 2` ← 平均法，两者物理对等
-     - 若 a、b 都取不到，回退 `voiceLen(Main)`
-     - 下限：`if (mainRaw < 20) mainRaw = 20`
-   - **若 Main 不以 `_` 结尾（拉伸，如 `gO`）**：
-     - `mainRaw = voiceLen(Main)` ← 供总和估算，不固定位置
-     - 下限：`if (mainRaw < 20) mainRaw = 20`
+**注意**：OpenUtau 引擎自身会把 `Overlap` 段渲染为前音素尾部和当前音素头部的共享段，phonemizer 无需再叠加。
 
-4. **计算介母期望时长** `medialExpected`：
-   - 每个介母 = `max(Preutter, Overlap)`，最小 20
+### 5.5 ProcessTransitions 主逻辑
 
-5. **计算所需总时长**：
-   - `fixedSum = endingReserve + mainRaw（若 main 固定）+ 所有韵尾 rawDur`
-   - `stretchSum = mainRaw（若 main 拉伸）+ 所有介母 medialExpected`
-   - `totalNeeded = fixedSum + stretchSum`
-   - `scale = min(1, T / totalNeeded)`
+**步骤 1：收集有效过渡音素**
 
-6. **应用 scale**：
-   - `actualMain = mainRaw × scale`（仅当 main 固定；拉伸型 main 不主动缩）
-   - `actualEnding = endingReserve × scale`
-   - `actualTrans[i] = rawDur 或 medialExpected × scale`
+对每个 `rule.TransitionPhonemes`，检查是否在声库中存在（`CheckOtoExists` 或 `CheckOtoUntilHit`）。存在则保留：
 
-7. **布局**：
-   - **6a. 从右往左排韵尾（非介母）**：
-     - `cursor = T - actualEnding`
-     - 倒序遍历，跳过介母，依次 `cursor -= actualTrans[i]`
-     - 下限 0，记录 `positions[i]`，`placed[i] = true`
-   - **6b. 介母紧贴 main 右边缘，占据剩余空间**：
-     - `newPos = actualMain`
-     - 下一锚点 = 后面第一个 `placed[j]` 的 `positions[j]`（若无则 `T - actualEnding`）
-     - 若 `newPos ≥ nextAnchor`，限制到 `nextAnchor - 10`
-     - `positions[i] = newPos`，`placed[i] = true`
+- `isMedial = t.EndsWith("_") && !t.StartsWith("_")` → 介母衔接部
+- 其余（以 `_` 开头）→ 韵尾衔接部
 
-8. 添加音素
+**步骤 2：尾音预留**
 
-### 5.5 时长分配策略
+```
+endingReserve = 0
+if (!hasNext && rule.Ending 非空)
+    endingReserve = max(20, min(totalDuration / 6, 60))
+```
 
-设：
+**步骤 3：mainRaw（main 原始长度）**
 
-- `fixedSum = endingReserve + mainRaw（若 main 固定）+ 所有韵尾 rawDur`
-- `stretchSum = mainRaw（若 main 拉伸）+ 所有介母 medialExpected`
-- `totalNeeded = fixedSum + stretchSum`
+- **Main 以 `_` 结尾（固定）**：
+  - `a = -Cutoff(main) - Preutter(main)`
+  - `b = Preutter(第一个介母衔接部)`
+  - `mainRaw = (a + b) / 2`，退化到 a 或 b
+- **Main 不以 `_` 结尾（拉伸）**：
+  - `mainRaw = -Cutoff(main) - Preutter(main)`
+- 下限 `mainRaw = max(20, mainRaw)`
 
-**统一缩放**：
+**步骤 4：main 拆辅音 / 元音**
 
-- 若 `totalDuration >= totalNeeded`：`scale = 1`，各音素保持原时长
-- 若 `totalDuration < totalNeeded`：`scale = totalDuration / totalNeeded`，所有音素等比缩
+```csharp
+int mainCons;
+if (oto.Consonant > 0 && oto.Consonant <= mainRaw)
+    mainCons = oto.Consonant;
+else
+    mainCons = (int)(oto.Preutter * 0.7);
 
-**应用**：
+// ★ 辅音不超过 mainRaw 的 2/3，保证元音至少 1/3
+int maxMainCons = mainRaw * 2 / 3;
+if (mainCons > maxMainCons) mainCons = maxMainCons;
+if (mainCons < 0) mainCons = 0;
 
-- `actualMain = mainRaw × scale`（仅当 main 固定；拉伸型 main 不主动缩，由布局自动处理）
-- `actualEnding = endingReserve × scale`
-- `actualTrans[i] = rawDur 或 medialExpected × scale`
-- 结果：所有部分的视觉总和 ≤ `totalDuration`，不溢出
+int mainVowel = mainRaw - mainCons;  // 元音段
+```
 
-**注**：main 固定时，其视觉长度在布局阶段会被"拉伸"到介母起点（6b），这是引擎采样尾部填充的结果，视觉表现符合"元音拉伸"。
+**步骤 5：介母拆辅音 / 元音（同上）**
 
-### 5.6 尾音到静音 ProcessEnding
+```csharp
+int expected = max(Preutter(med), Overlap(med));
+if (expected < 20) expected = 20;
+
+int prot = min(Preutter(med), expected);
+if (prot < 20) prot = 20;
+if (prot > expected) prot = expected;
+
+// ★ 不超过 expected 的 2/3
+int maxProt = expected * 2 / 3;
+if (prot > maxProt) prot = maxProt;
+
+medCons[i]  = prot;
+medVowel[i] = expected - prot;
+```
+
+**步骤 6：三段分类**
+
+```
+S1 = 元音段总量 = mainVowel + Σ medVowel
+S2 = 衔接段总量 = tailCons + endingReserve + Σ medCons
+S3 = main 辅音段 = mainCons
+```
+
+**步骤 7：缩放（元音 1/2 下限 + 剩余按需求比例）**
+
+```
+if (S1 + S2 + S3 > totalDuration):
+    minVowel = totalDuration / 2       // ★ 元音至少占一半
+    actualVowel = min(S1, minVowel)
+    vScale = actualVowel / S1
+
+    remaining = totalDuration - actualVowel
+    s23 = S2 + S3
+    if (remaining >= s23):
+        tScale = 1; mScale = 1
+    else:
+        roomT = remaining * S2 / s23     // ★ 按需求比例
+        roomM = remaining - roomT
+        tScale = roomT / S2
+        mScale = roomM / S3
+```
+
+语义：
+
+- **元音永远至少占 `totalDuration / 2`**，但不超过元音实际需求
+- 剩下的空间按"衔接段想要多少"和"main 辅音想要多少"的比例分配
+- 相当于：**元音优先保一半**，剩下的一半内部按需分配
+
+**步骤 8：计算实际长度**
+
+```csharp
+int actualCons = (int)(mainCons * mScale);
+int actualVowel = (int)(mainVowel * vScale);
+
+// ★ 辅音视觉上限 = 元音视觉长度的 1.5 倍
+int consCap = actualVowel * 3 / 2;
+if (consCap < 20) consCap = 20;
+if (actualCons > consCap)
+{
+    int surplus = actualCons - consCap;
+    actualCons = consCap;
+    actualVowel += surplus;      // 多出的 tick 转给元音
+}
+
+int actualMain = actualCons + actualVowel;
+```
+
+`/3*2` 这里的 `3/2` 就是"辅音最大是元音的 1.5 倍"。想更严就改成 `1`，想更松就 `2`。
+
+**步骤 9：布局**
+
+- **6a. 从右往左排韵尾（非介母）**：
+  - `cursor = T - actualEnding`
+  - 倒序遍历，跳过介母，依次 `cursor -= actualTrans[i]`
+  - 下限 0，记录 `positions[i]`，`placed[i] = true`
+- **6b. 介母紧贴 main 右边缘**：
+  - `newPos = actualMain`
+  - 下一锚点 = 后面第一个 `placed[j]` 的 `positions[j]`（若无则 `T - actualEnding`）
+  - 若 `newPos >= nextAnchor` → `newPos = max(0, nextAnchor - 1)`（**1 tick 间隔**）
+
+**步骤 10：输出诊断日志**
+
+```
+[LAYOUT] MAIN=xxx T=... mainRaw=... mainCons=... mainVowel=...
+         tailCons=... endingReserve=...
+         S1=... S2=... S3=...
+         vScale=... tScale=... mScale=...
+```
+
+### 5.6 关键设计点
+
+**元音下限 1/2**：短音时优先保证元音占一半。因为元音是听感主体，辅音太长会让音节听起来像干擦。
+
+**衔接 / 辅音按需求比例**：如果某个音节的韵尾本来就很短（S2 小），它不会抢太多空间；如果 main 辅音特别长（S3 大），才被多分。这比写死比例（如 4:6）更智能。
+
+**main 辅音 2/3 上限**：保证 main 元音至少 `mainRaw / 3`，防止某些声库的 `Consonant` 字段过大把元音挤没。
+
+**consCap 软削**：如果缩放后辅音仍超过元音 1.5 倍，多出的 tick 转给元音，进一步保护元音视觉。
+
+**VC 软削**：VC 视觉长度超过自身物理辅音长度或侵占前一个音符 1/3 时，取当前值与上限的平均值（**软削，不硬砍**）。硬砍会让 VC 缩进音符内部，视觉上"消失"。
+
+### 5.7 尾音到静音 ProcessEnding
 
 - **条件**：无下一个音符 且 `rule.Ending` 非空
 - **音素**：`"Ending R"` 优先，找不到用 `"Ending -"`
 - **长度**：`min(totalDuration / 6, 60)`
 - **位置**：`totalDuration - endingLength`
 
-### 5.7 介母布局
-
-- 介母（以 `_` 结尾的过渡音素）起点 = `mainRaw`
-- 即紧贴 main 右边缘
-- 剩余空间（`mainRaw` → 下一锚点）由介母占据
-- 视觉长度 = `nextAnchor − mainRaw`
-- 若起点越过下一锚点，限制到 `nextAnchor − 10`
-- **目的**：遇到介母就固定起点，遇到元音就让元音拉伸
-
 ### 5.8 main 下限
 
 - 只有硬下限 `mainRaw = max(mainRaw, 20)`
 - 不再随 T 变（取消 `T/10` 和 `T/3` 的比例限制）
 - 目的：让固定音素真正"固定"，不被比例撑大
-- 布局 6a 的 `cursor` 最低可为 0，不再保留 `minMain` 区
 
 ---
 
@@ -406,8 +492,6 @@ protected virtual string[] Romanize(IEnumerable<string> lyrics)
 
 ## 八、常见问题排查
 
-> **注意**：音素器目前没有日志输出，所有问题只能从音素轨道上的视觉效果和听感反推。
-
 ### 8.1 使用者常见问题
 
 **[U1] 输入汉字没反应**
@@ -419,23 +503,24 @@ A：`scheme.ini` 的键必须与 G2P 输出一致（无声调拼音 / 粤拼）�
 A：
 
 - 检查 OpenUtau 的 `Plugins\` 目录，DLL 是否复制进去
+- **确认复制的是 `bin\Debug\<框架>\` 里的 DLL，不是 `obj\...\ref\` 或 `refint\` 里的**
 - 确认 OpenUtau 版本与 DLL 目标框架匹配（net8 版对 net8 版 OpenUtau，net10 版对 net10 版）
-- **同一个 `Plugins\` 目录里不能同时放 net8 和 net10 两个版本**，Tag 相同会冲突，只保留当前 OpenUtau 版本对应的那份
+- **同一个 `Plugins\` 目录里不能同时放 net8 和 net10 两个版本**，Tag 相同会冲突
 
 **[U3] 音符被唱出奇怪的效果**
 
-A：逐项排查：
+A：查 `[LAYOUT]` 和 `[VC]` 日志（OpenUtau `Help → Open Logs Location`）：
 
-- 音素未发声 → 检查 `scheme.ini` 的 `Main` 字段是否拼写正确、声库 oto 里是否有该别名
-- 辅音太长挤掉元音 → 检查 oto 里该 VC 的 `Cutoff` 是否过大（`-Cutoff - Preutter` 决定 VC 视觉长度）
-- 介母被拉伸过长 → 检查 oto 里 `Preutter` 和 `Overlap`，`mainRaw = (a + b) / 2` 决定 main 视觉长度
-- 短音时音素挤成一团 → 属于极限情况，所有音素被等比缩，无解
+- `mainCons` 是否被卡在 2/3 —— 正常
+- `S1` 是否至少占 `T/2` —— 是说明元音被保护了
+- `vScale` / `tScale` / `mScale` 三个是否合理 —— 都 < 1 说明整体被压
+- `[VC]` 里 `vcLength` / `vcPos` 是否落在负数（正常）或正数（异常，VC 侵入音符内部）
 
 ### 8.2 开发者常见问题
 
 **[D1] 音符总时长判定异常**
 
-A：OpenUtau 会把主音符和它后面所有 `+` 合并成 `notes[]`，`totalDuration = sum(notes[i].duration)`。若处理孤立 `+`（`notes[0].lyric == "+"`），建议返回 `MakeSimpleResult("-", attr0)`。
+A：OpenUtau 会把主音符和它后面所有 `+` 合并成 `notes[]`，`totalDuration = sum(notes[i].duration)`。
 
 **[D2] net8 编译时提示 `??` 不可套用至 'int'**
 
@@ -444,27 +529,26 @@ A：net8 的 `toneShift` 是 `int`，net10 是 `int?`。全局替换：
 - net8 源码：`(attr.toneShift ?? 0)` → `attr.toneShift`
 - net10 源码：保持 `(attr.toneShift ?? 0)`
 
-**[D3] 音素视觉效果不符合预期**
+**[D3] 两版本（net8 / net10）行为不一致**
 
-A：无日志时按下列顺序肉眼诊断：
+A：源码需各自独立维护。改一处逻辑时，**两份 `.cs` 都要同步改**，尤其注意 `toneShift` 写法差异。
 
-1. **main 视觉过短** → `mainRaw` 被 `min(a, b)` 或平均法算小 → 检查 oto 里 `Preutter` 和 `Cutoff`
-2. **main 视觉过长** → 检查 `minMain` 或比例上限是否被误加（应只有 `max(20, mainRaw)`）
-3. **介母视觉过短** → 6b 中 `newPos ≥ nextAnchor` 被触发 → 检查 6a 韵尾位置
-4. **整体溢出音符范围** → 检查 `scale = min(1, T / totalNeeded)` 是否被误删
-5. **VC 视觉过长** → 检查三重上限（`prevSpan / 3`、自身 `-Cutoff - Preutter`、空隙 `gap`）
-
-**[D4] 两个版本（net8 / net10）行为不一致**
-
-A：源码需各自独立维护。改一处逻辑（如 `mainRaw` 公式）时，**两份 `.cs` 都要同步改**，尤其注意 `toneShift` 写法差异。
-
-**[D5] 编译通过但音素器加载后无效**
+**[D4] 编译通过但音素器加载后无效**
 
 A：
 
 - 检查 `[Phonemizer]` 的 Tag 是否与其他插件重复
 - 检查 `class` 是否被 `public` 修饰
-- 检查 DLL 是否被 OpenUtau 识别（看 OpenUtau 日志或 `Plugins\` 目录下的 `.pdb` 是否加载）
+- **检查是否复制了正确的 DLL**（`bin\` 里的，不是 `obj\` 里的）
+
+**[D5] 元音被挤压到几乎不可见**
+
+A：检查顺序：
+
+1. `[LAYOUT]` 里 `mainCons` 是否 = `mainRaw * 2/3`（2/3 上限是否生效）
+2. `S1` 是否 ≥ `T/2`（元音下限 1/2 是否生效）
+3. `consCap` 是否被触发（辅音视觉是否被软削）
+4. 该音符 `T` 是否过小（< 20 tick 时数值受限，物理不可变）
 
 ---
 
@@ -476,7 +560,7 @@ A：
 
 - 失败：`SetUp` 里手动合并 `+` 到前音符，与 OpenUtau 架构冲突
 - 失败：空音符数组返回导致渲染崩溃
-- 重构：删除 `SetUp` 里的合并逻辑，改为信任 `notes[]` 数组；孤立 `+` 返回静音占位符
+- 重构：删除 `SetUp` 里的合并逻辑，改为信任 `notes[]` 数组
 - 引入以 `_` 结尾 / 开头判断，分离"拉伸音素"与"固定音素"
 - 从右往左布局固定音素，介母、韵尾、整音分别处理
 - oto 字段迭代：试过 `Consonant`、`Preutter`、`-Cutoff-Preutter`、平均值
@@ -487,32 +571,31 @@ A：
 
 在工程版本基础上重构、修正与扩充，形成稳定发布版。
 
-- **过渡音素布局重构**：
-  - 原问题：介母、韵尾、main 混排，长音时 main 视觉被不合理撑大
-  - 重构：引入 `placed[]` 追踪已定位音素，拆成 6a（韵尾从右往左排）和 6b（介母紧贴 main 右边缘）
-  - 结果：main 视觉固定，介母占据剩余空间，元音在听感上拉伸
-- **main 固定时长定稿**：
-  - `a = -Cutoff(main) - Preutter(main)`（main 采样里介母部分的长度）
-  - `b = Preutter(med)`（med 采样里介母部分的长度）
-  - `mainRaw = (a + b) / 2`（两个物理对等的量取平均）
-  - 硬下限只有 20 tick，取消 `T/10`、`T/3` 比例限制
-- **时长分配定稿**：
-  - `scale = min(1, T / totalNeeded)`，所有音素统一等比缩
-  - 保证视觉总和 ≤ `totalDuration`
-- **VC 长度算法定稿**：
-  - 原问题：`VC 长度 = Preutter(Main)`，预发声到采样起点那段元音被算进 VC 视觉宽度
-  - 修正：`VC 长度 = -Cutoff - Preutter`，即预发声点到采样右边界
-  - 语义：只覆盖辅音起始段，与前一音符尾音衔接处的元音不重复计算
-  - 上限：自身 `-Cutoff - Preutter`
-  - 效果：长辅音（如 `7 h`、`a y`）不再因为预发声长而视觉过长
-- **介母缩放权重定稿**：`max(Preutter, Overlap)`，最小 20
-  仅用于缩短时估算 `stretchSum`，不直接决定布局
-- **net10 兼容版本**：
-  - 背景：OpenUtau 主程序升级到 net10 后，旧 net8 插件无法加载
-  - 方案：新增 net10 目标框架的 csproj 副本，源码独立维护
-  - 差异：`PhonemeAttributes.toneShift` 在 net8 是 `int`，在 net10 是 `int?`
-  - 写法：net8 用 `attr.toneShift`，net10 用 `(attr.toneShift ?? 0)`
-  - 结果：net8 与 net10 两份 DLL，分别放入对应版本的 OpenUtau
+- **过渡音素布局重构**：拆成 6a（韵尾从右往左排）和 6b（介母紧贴 main 右边缘）
+- **main 固定时长定稿**：`mainRaw = (a + b) / 2`，a、b 物理对等
+- **时长分配定稿**：`scale = min(1, T / totalNeeded)`，所有音素统一等比缩
+- **VC 长度算法定稿**：`VC 长度 = -Cutoff - Preutter`
+- **net10 兼容版本**：`toneShift` 类型差异，源码独立维护
+
+**阶段 3：三段式元音保护（当前）**
+
+用户反馈：短音时辅音占满整块，元音被挤压。
+
+- **问题根因**：早期 `mainProtected = mainPre` 导致 main 辅音段先占满，元音只剩残渣
+- **修复 1**：`mainCons` 从 `Preutter` 改为 `Consonant`，语义更贴合物理辅音长度
+- **修复 2**：加 2/3 上限，保证 main 元音至少 `mainRaw / 3`
+- **修复 3**：从二段式（vowel/protected）改为三段式（元音/衔接/main 辅音），各有独立缩放优先级
+- **修复 4**：改为元音下限 `T/2` + 剩余按 S2:S3 需求比例分配
+- **修复 5**：`consCap = actualVowel * 3 / 2` 软削，多出的 tick 转给元音
+- **修复 6**：VC 软削（`vcVoiceMax` 和 `maxOverrun`），不硬砍
+- **诊断日志**：`[LAYOUT]` 输出所有关键变量；`[VC]` 输出 VC 关键值
+
+**阶段的教训**：
+
+1. **"固定音素"不应是"永不缩"**。短音时真正该优先缩的是元音，其次衔接，最后才是 main 辅音。
+2. **软削优于硬砍**。VC 硬砍到小于 `mainOverlap` 时，`vcPosition` 会变成正数，VC 侵入音符内部，视觉上"消失"。
+3. **诊断日志是排查的第一生产力**。`[LAYOUT]` 一行能把所有关键变量暴露出来，比肉眼推断快 10 倍。
+4. **四文件同步**。改一处逻辑后立刻同步另外三份，只改 `toneShift` 写法。
 
 ---
 
@@ -536,11 +619,12 @@ A：
 | `Process()` | 主入口 |
 | `ProcessOnset()` | 开头音 |
 | `ProcessContinuation()` | 非开头音 |
-| `ComputeVcLength()` | VC 长度计算 |
+| `ComputeVcLength()` | VC 长度计算（含 ovAbs 平均 + mainPre） |
+| `GetMainOverlap()` | main Overlap 转 tick |
 | `GetVoiceLength()` | `-Cutoff - Preutter` |
-| `GetFixedDuration()` | `(voiceLen + consonant) / 2` |
+| `GetFixedDuration()` | `(voiceLen + consonant) / 2`（`_` 开头用 voiceLen） |
 | `ResolveAlias()` | 音素别名解析 |
-| `ProcessTransitions()` | 过渡音素布局 |
+| `ProcessTransitions()` | 过渡音素布局（三段分类 + 元音下限 + 按需求比例） |
 | `ProcessEnding()` | 尾音到静音 |
 | `GetAttr()` | 读取音符属性 |
 | `AddMainPhoneme()` | 添加主音素 |
@@ -550,12 +634,74 @@ A：
 | `MakeSimpleResult()` | 快捷返回 |
 | `CVnCRule` | 规则数据结构 |
 
+**关键常量**（可调）：
+
+| 位置 | 值 | 说明 |
+|------|-----|------|
+| `ProcessTransitions` `minVowel` | `totalDuration / 2` | 元音下限比例 |
+| `ProcessTransitions` `maxMainCons` | `mainRaw * 2 / 3` | main 辅音上限比例 |
+| `ProcessTransitions` `maxProt` | `expected * 2 / 3` | 介母辅音上限比例 |
+| `ProcessTransitions` `consCap` | `actualVowel * 3 / 2` | 辅音视觉上限（1.5 倍元音） |
+| `ProcessTransitions` 6b `nextAnchor` 间隔 | `1` | 介母与下一锚点最小间隔 |
+| `ProcessContinuation` `maxOverrun` | `prevDur / 3` | VC 侵占前音符最大比例 |
+| `ComputeVcLength` 最小值 | `30` | VC 最小 tick |
+
 **字段**：
 
 | 字段 | 说明 |
 |------|------|
 | `singer` | `USinger` 实例 |
 | `rules` | `Dictionary<string, CVnCRule>` |
+
+---
+
+## 十一、调试指南
+
+### 11.1 开启日志
+
+OpenUtau `Help → Open Logs Location` 打开日志文件，搜 `[LAYOUT]` 和 `[VC]`。
+
+### 11.2 关键日志解读
+
+**`[LAYOUT]` 一行示例**：
+
+```
+[LAYOUT] MAIN=si T=184 mainRaw=263 mainCons=175 mainVowel=88
+         tailCons=0 endingReserve=0
+         S1=88 S2=0 S3=175
+         vScale=0.693 tScale=1.000 mScale=0.703
+```
+
+- `T=184`：音符总 tick
+- `mainRaw=263`：main 原始长度
+- `mainCons=175`：`263 * 2/3 = 175`，2/3 上限生效
+- `mainVowel=88`：`263 - 175 = 88`
+- `S1/S2/S3`：元音 / 衔接 / main 辅音三段需求
+- `vScale/tScale/mScale`：三段各自的缩放系数
+
+验算：`actualVowel = min(88, 92) = 88`（元音需求 < T/2），`remaining = 96`，`tScale = 1`（S2=0），`mScale = 96/175 = 0.549`。`consCap = 88*1.5 = 132 > 96`，不触发软削。
+
+**`[VC]` 一行示例**：
+
+```
+[VC] alias=A' s vcLength=43 mainOverlap=68 vcPos=25
+     notePos=53640 noteDur=87
+[VC] prevPos=53520 prevDur=120 prevEnd=53640
+     | vcAbs=53665 overrun=-25 gap=0
+```
+
+- `vcLength=43`：VC 视觉宽度
+- `vcPos=25`：VC 位置，正数说明 VC 侵入音符内部（异常）
+- `overrun=-25`：负数说明 VC 左边界在音符起点后 25 tick（异常）
+
+`overrun` 应该是正数（VC 侵占前一个音符）、`vcPos` 应该是负数。**如果反了，说明 VC 被硬砍得太短。**
+
+### 11.3 排查流程
+
+1. 看 `[LAYOUT]` 里的 `mainCons / mainVowel` 比例
+2. 看 `vScale / tScale / mScale` 是否 < 1
+3. 看 `[VC]` 里的 `vcPos` 是否 < 0
+4. 如果一切数值都合理但视觉不对，检查 **DLL 是否真的更新**（时间戳、是否从 `bin\` 复制）
 
 ---
 

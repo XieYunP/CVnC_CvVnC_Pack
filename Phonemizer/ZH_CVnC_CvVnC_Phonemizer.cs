@@ -233,22 +233,14 @@ namespace OpenUtau.Core
                 var vcCandidates = new List<string> { $"- {rule.Prefix}" };
                 if (singer != null && CheckOtoUntilHit(vcCandidates, note, attr, out var onsetOto))
                 {
-                    // 取 VC 的 Preutter 与 main 的预发声到右边界的平均值
                     int vcVoice = (int)(-onsetOto.Cutoff - onsetOto.Preutter);
                     if (vcVoice <= 0) vcVoice = 60;
                     int mainMs = GetVoiceLength(rule.Main, note, attr);
                     int avgMs = (vcVoice + mainMs) / 2;
-                    // 不能超过 VC 自身的真实长度
                     if (avgMs > vcVoice) avgMs = vcVoice;
                     int vcLength = -timeAxis.MsToTickAt(-avgMs, endTick);
 
-                    try
-                    {
-                        double stretch = attr1.consonantStretchRatio ?? 1;
-                        vcLength = (int)(vcLength * stretch);
-                    }
-                    catch { }
-
+                    try { vcLength = (int)(vcLength * (attr1.consonantStretchRatio ?? 1)); } catch { }
                     vcLength = Math.Max(20, vcLength);
 
                     phonemes.Add(new Phoneme
@@ -284,13 +276,12 @@ namespace OpenUtau.Core
             Note note, PhonemeAttributes attr,
             int totalDuration, int endTick,
             Note? prevNeighbour)
-
         {
             string prevEnding = prevRule?.Ending ?? "";
 
             if (!string.IsNullOrEmpty(rule.Prefix))
             {
-                // ncv 优先（前尾音 + 当前整音，如 "n~ zA"）
+                // ncv 优先
                 if (!string.IsNullOrEmpty(prevEnding))
                 {
                     var ncvCandidates = new List<string> { $"{prevEnding} {rule.Main}" };
@@ -304,73 +295,74 @@ namespace OpenUtau.Core
                         return;
                     }
                 }
-                // 有辅音： "prevEnding prefix" -> "prefix" -> "main"
-                var candidates = new List<string>();
+
+                var vcCandidates = new List<string>();
                 if (!string.IsNullOrEmpty(prevEnding))
+                    vcCandidates.Add($"{prevEnding} {rule.Prefix}");
+                vcCandidates.Add(rule.Prefix);
+                vcCandidates.Add(rule.Main);
+
+                if (singer != null && CheckOtoUntilHit(vcCandidates, note, attr, out var vcOto))
                 {
-                    candidates.Add($"{prevEnding} {rule.Prefix}");
-                }
-                candidates.Add(rule.Prefix);
-                candidates.Add(rule.Main);
+                    UOto mainOtoForVc = default;
+                    singer?.TryGetMappedOto(rule.Main, note.tone + attr.toneShift, attr.voiceColor, out mainOtoForVc);
+                    int vcLength = ComputeVcLength(vcOto, mainOtoForVc, endTick);
+                    int mainOverlap = GetMainOverlap(rule.Main, note, attr, endTick);
 
-                if (singer != null && CheckOtoUntilHit(candidates, note, attr, out var vcOto))
-                {
-                    int vcLength = ComputeVcLength(vcOto, endTick);
+                    // 上限 1：VC 自身物理辅音长度（软削）
+                    int vcVoiceMax = (int)(-vcOto.Cutoff - vcOto.Preutter);
+                    if (vcVoiceMax > 0 && vcLength > vcVoiceMax)
+                        vcLength = (vcLength + vcVoiceMax) / 2;
 
-                    if (!string.IsNullOrEmpty(prevEnding) && singer != null &&
-                           singer.TryGetMappedOto(prevEnding, note.tone + attr.toneShift, attr.voiceColor, out var prevEndOto))
-                    {
-                        int prevEndVoice = (int)(-prevEndOto.Cutoff - prevEndOto.Preutter);
-                        int prevOverlap = (int)prevEndOto.Overlap;
-                        if (prevOverlap < 0) prevOverlap = 0;
-
-                        // 合并跨度 = VC + 前尾音 - 重叠量，再取一半
-                        int combined = vcLength + prevEndVoice - prevOverlap;
-                        if (combined > 0)
-                            vcLength = combined * 2 / 3;
-                    }
-
-                    // 用实际跨度（含 "+"）而不是 raw duration
+                    // 上限 2：不侵占前一个音符超过 1/3（软削）
                     if (prevNeighbour.HasValue)
                     {
                         var pn = prevNeighbour.Value;
-                        int prevSpan = Math.Max(pn.duration, note.position - pn.position);
-
-                        // 上限 = 前音符跨度的 2/3（宽松，避免因前音符太短就被砍）
-                        int upper = Math.Max(10, prevSpan / 3);   // 上限 1/3
-                        vcLength = Math.Min(vcLength, upper);
-
-                        // 空隙避让：VC 不能侵占到前音符内部
-                        int gap = note.position - (pn.position + pn.duration);
-                        if (gap > 0)
-                        {
-                            vcLength = Math.Min(vcLength, gap);
-                        }
-                        // gap <= 0 说明音符紧贴或重叠，不限制，让 OpenUtau 引擎自己处理
-                        // VC 上限 = 自身 Consonant
-                        int vcVoice = (int)(-vcOto.Cutoff - vcOto.Preutter);
-                        if (vcVoice > 0 && vcLength > vcVoice)
-                            vcLength = vcVoice;
-                        if (vcLength < 10) vcLength = 10;
+                        int prevEnd = pn.position + pn.duration;
+                        int gap = Math.Max(0, note.position - prevEnd);
+                        int maxOverrun = pn.duration / 3;
+                        int cap = gap + maxOverrun + mainOverlap;
+                        if (cap < 20) cap = 20;
+                        if (vcLength > cap)
+                            vcLength = (vcLength + cap) / 2;
                     }
+
+                    if (vcLength < 10) vcLength = 10;
+                    int vcPosition = -vcLength + mainOverlap;
 
                     phonemes.Add(new Phoneme
                     {
                         phoneme = AppendVoiceColor(vcOto.Alias, attr),
-                        position = -vcLength,
+                        position = vcPosition,
                     });
-                }   
 
-                AddMainPhoneme(phonemes, rule.Main, note, attr, 0);   // ← 在 if 外面
+                    AddMainPhoneme(phonemes, rule.Main, note, attr, 0);
+                    return;
+                }
+
+                var mainCandidates = new List<string>();
+                if (!string.IsNullOrEmpty(prevEnding))
+                    mainCandidates.Add($"{prevEnding} {rule.Main}");
+                mainCandidates.Add(rule.Main);
+
+                if (singer != null && CheckOtoUntilHit(mainCandidates, note, attr, out var oto1))
+                {
+                    phonemes.Add(new Phoneme
+                    {
+                        phoneme = AppendVoiceColor(oto1.Alias, attr),
+                        position = 0,
+                    });
+                }
+                else
+                {
+                    AddMainPhoneme(phonemes, rule.Main, note, attr, 0);
+                }
             }
             else
             {
-                // 无辅音： "prevEnding main" -> "main"
                 var candidates = new List<string>();
                 if (!string.IsNullOrEmpty(prevEnding))
-                {
                     candidates.Add($"{prevEnding} {rule.Main}");
-                }
                 candidates.Add(rule.Main);
 
                 if (singer != null && CheckOtoUntilHit(candidates, note, attr, out var oto))
@@ -388,14 +380,29 @@ namespace OpenUtau.Core
             }
         }
 
-
-        private int ComputeVcLength(UOto oto, int endTick)
+        private int ComputeVcLength(UOto vcOto, UOto mainOto, int endTick)
         {
-            // 从预发声点到右边界
-            double ms = -oto.Cutoff - oto.Preutter;
-            if (ms <= 0) ms = 60;
-            int vcLength = -timeAxis.MsToTickAt(-ms, endTick);
-            return Math.Max(30, vcLength);
+            int vcVoice = (int)(-vcOto.Cutoff - vcOto.Preutter);
+            if (vcVoice < 0) vcVoice = 0;
+
+            int ov = (int)mainOto.Overlap;
+            int ovAbs = ov < 0 ? -ov : ov;
+
+            int pre = (int)mainOto.Preutter;
+
+            int totalMs = (vcVoice + ovAbs) / 2 + pre;
+            if (totalMs <= 0) totalMs = 30;
+
+            return Math.Max(30, -timeAxis.MsToTickAt(-totalMs, endTick));
+        }
+
+        private int GetMainOverlap(string mainPhoneme, Note note, PhonemeAttributes attr, int endTick)
+        {
+            if (singer == null) return 0;
+            if (!singer.TryGetMappedOto(mainPhoneme, note.tone + attr.toneShift, attr.voiceColor, out var oto))
+                return 0;
+            double ovMs = oto.Overlap;   // 可为负
+            return -timeAxis.MsToTickAt(-ovMs, endTick);
         }
 
         // 预发声到右边界
@@ -444,7 +451,7 @@ namespace OpenUtau.Core
             return phoneme;
         }
 
-        // -------- 过渡音素（缩短等比、拉长只拉拉伸点）--------
+        // -------- 过渡音素--------
         private void ProcessTransitions(
             List<Phoneme> phonemes, CVnCRule rule, Note note,
             PhonemeAttributes attr, int totalDuration, bool hasNext)
@@ -471,22 +478,22 @@ namespace OpenUtau.Core
             if (!hasNext && !string.IsNullOrEmpty(rule.Ending))
                 endingReserve = Math.Max(20, Math.Min(totalDuration / 6, 60));
 
-            // ========== 3. main 固定时长 ==========
+            // ========== 3. main 原始长度 ==========
             bool mainIsFixed = rule.Main.EndsWith("_");
             int mainRaw;
 
+            UOto mainOto = default;
+            bool hasMainOto = singer != null && singer.TryGetMappedOto(
+                rule.Main, note.tone + attr.toneShift, attr.voiceColor, out mainOto);
+
             if (mainIsFixed)
             {
-                // a = ji_ 里介母 i 的长度 = 预发声点到采样终点
                 int a = 0;
-                if (singer != null && singer.TryGetMappedOto(rule.Main,
-                        note.tone + attr.toneShift, attr.voiceColor, out var mainOto))
+                if (hasMainOto)
                 {
                     a = (int)(-mainOto.Cutoff - mainOto.Preutter);
                     if (a < 0) a = 0;
                 }
-
-                // b = 第一个介母衔接部的 Preutter
                 int b = 0;
                 if (singer != null)
                 {
@@ -496,7 +503,6 @@ namespace OpenUtau.Core
                         if (!t.EndsWith("_") || t.StartsWith("_")) continue;
                         if (!CheckOtoExists(t, note.tone, attr)
                             && !CheckOtoUntilHit(new List<string> { t }, note, attr, out _)) continue;
-
                         if (singer.TryGetMappedOto(t, note.tone + attr.toneShift, attr.voiceColor, out var otoM))
                         {
                             b = (int)otoM.Preutter;
@@ -505,8 +511,6 @@ namespace OpenUtau.Core
                         }
                     }
                 }
-
-                // 平均法
                 if (a > 0 && b > 0) mainRaw = (a + b) / 2;
                 else if (a > 0) mainRaw = a;
                 else if (b > 0) mainRaw = b;
@@ -514,15 +518,34 @@ namespace OpenUtau.Core
             }
             else
             {
-                // main 是拉伸音素（辅音到元音）
                 mainRaw = GetVoiceLength(rule.Main, note, attr);
             }
-
-            // 只保底 20 tick，不随 T 变
             if (mainRaw < 20) mainRaw = 20;
 
-            // ========== 4. 介母期望时长 ==========
-            int[] medialExpected = new int[transitions.Count];
+            // ========== 4. main 拆辅音 / 元音（元音至少 1/3）==========
+            int mainCons = 0;
+            if (hasMainOto)
+            {
+                int c = (int)mainOto.Consonant;
+                int p = Math.Max(0, (int)mainOto.Preutter);
+                if (c > 0 && c <= mainRaw) mainCons = c;
+                else mainCons = (int)(p * 0.7);
+            }
+
+            // main 辅音最多占 mainRaw 的 2/3，保证元音至少 1/3
+            int maxMainCons = mainRaw * 2 / 3;
+            if (mainCons > maxMainCons) mainCons = maxMainCons;
+            if (mainCons < 0) mainCons = 0;
+            int mainVowel = Math.Max(0, mainRaw - mainCons);
+
+            // 韵尾等非介母（整体归衔接段）
+            int tailCons = 0;
+            foreach (var t in transitions)
+                if (!t.isMedial) tailCons += t.rawDur;
+
+            // ========== 5. 介母拆辅音 / 元音（同样给元音 1/3 保护）==========
+            int[] medCons = new int[transitions.Count];
+            int[] medVowel = new int[transitions.Count];
             for (int i = 0; i < transitions.Count; i++)
             {
                 if (!transitions[i].isMedial) continue;
@@ -534,46 +557,121 @@ namespace OpenUtau.Core
                     if (ov < 0) ov = 0;
                     int expected = Math.Max(pre, ov);
                     if (expected < 20) expected = 20;
-                    medialExpected[i] = expected;
+
+                    int prot = pre < expected ? pre : expected;
+                    if (prot < 20) prot = 20;
+                    if (prot > expected) prot = expected;
+
+                    // 介母辅音也不超过期望的 2/3
+                    int maxProt = expected * 2 / 3;
+                    if (prot > maxProt) prot = maxProt;
+
+                    medCons[i] = prot;
+                    medVowel[i] = expected - prot;
                 }
                 else
                 {
-                    medialExpected[i] = 20;
+                    medCons[i] = 20;
+                    medVowel[i] = 0;
                 }
             }
 
-            // ========== 5. 计算所需总时长，决定是否等比缩 ==========
-            int fixedSum = endingReserve + (mainIsFixed ? mainRaw : 0);
-            foreach (var t in transitions)
-                if (!t.isMedial) fixedSum += t.rawDur;
+            // ========== 6. 缩放：元音锁 T/3，剩余按 S2:S3 需求比例 ==========
+            int s1 = mainVowel;
+            foreach (var v in medVowel) s1 += v;
 
-            int stretchSum = (mainIsFixed ? 0 : mainRaw);
-            for (int i = 0; i < transitions.Count; i++)
-                if (transitions[i].isMedial) stretchSum += medialExpected[i];
+            int s2 = tailCons + endingReserve;
+            foreach (var c in medCons) s2 += c;
 
-            int totalNeeded = fixedSum + stretchSum;
-            double scale = 1.0;
-            if (totalDuration < totalNeeded && totalNeeded > 0)
-                scale = (double)totalDuration / totalNeeded;
+            int s3 = mainCons;
 
-            int actualMain = mainIsFixed
-                ? Math.Max(1, (int)(mainRaw * scale))
-                : mainRaw;   // 拉伸型 main 不主动缩，让布局自动处理
+            double vScale = 1.0;
+            double tScale = 1.0;
+            double mScale = 1.0;
 
-            int actualEnding = Math.Max(1, (int)(endingReserve * scale));
+            int totalNeeded = s1 + s2 + s3;
+            if (totalNeeded > totalDuration)
+            {
+                // 元音下限
+                int minVowel = totalDuration / 2;      // 元音至少 50%
+
+                int actualVowel;
+                if (s1 <= minVowel)
+                {
+                    // 元音需求本来就不到 T/3 → 全保，不拉长
+                    actualVowel = s1;
+                    vScale = 1.0;
+                }
+                else
+                {
+                    // 元音需求大于 T/3 → 缩到 T/3
+                    actualVowel = minVowel;
+                    vScale = (double)actualVowel / s1;
+                }
+
+                int remaining = totalDuration - actualVowel;
+                if (remaining < 0) remaining = 0;
+
+                int s23 = s2 + s3;
+                if (s23 > 0)
+                {
+                    if (remaining >= s23)
+                    {
+                        tScale = 1.0;
+                        mScale = 1.0;
+                    }
+                    else
+                    {
+                        // 按需求比例分剩余
+                        int roomT = (int)((long)remaining * s2 / s23);
+                        int roomM = remaining - roomT;
+                        tScale = s2 > 0 ? Math.Min(1.0, (double)roomT / s2) : 1.0;
+                        mScale = s3 > 0 ? Math.Min(1.0, (double)roomM / s3) : 1.0;
+                    }
+                }
+            }
+
+            Log.Warning($"[LAYOUT] MAIN={rule.Main} T={totalDuration} mainRaw={mainRaw} " +
+                        $"mainCons={mainCons} mainVowel={mainVowel} tailCons={tailCons} endingReserve={endingReserve} " +
+                        $"S1={s1} S2={s2} S3={s3} vScale={vScale:F3} tScale={tScale:F3} mScale={mScale:F3}");
+
+            // ========== 7. 计算实际长度 ==========
+            int actualCons = (int)(mainCons * mScale);
+            // 辅音视觉上限 = 元音视觉长度的 1.5 倍（可调）
+            int actualVowelTmp = (int)(mainVowel * vScale);
+            int consCap = actualVowelTmp * 3 / 2;
+            if (consCap < 20) consCap = 20;
+            if (actualCons > consCap)
+            {
+                // 省下的 tick 转给元音
+                int surplus = actualCons - consCap;
+                actualCons = consCap;
+                actualVowelTmp += surplus;
+            }
+            int actualMain = actualCons + actualVowelTmp;
+            if (actualMain < 1) actualMain = 1;
+
+            int actualEnding = Math.Max(1, (int)(endingReserve * tScale));
 
             int[] actualTrans = new int[transitions.Count];
             for (int i = 0; i < transitions.Count; i++)
             {
-                int raw = transitions[i].isMedial ? medialExpected[i] : transitions[i].rawDur;
-                actualTrans[i] = Math.Max(1, (int)(raw * scale));
+                if (transitions[i].isMedial)
+                {
+                    int c = (int)(medCons[i] * tScale);
+                    int v = (int)(medVowel[i] * vScale);
+                    actualTrans[i] = Math.Max(1, c + v);
+                }
+                else
+                {
+                    actualTrans[i] = Math.Max(1, (int)(transitions[i].rawDur * tScale));
+                }
             }
 
-            // ========== 6. 布局 ==========
+            // ========== 8. 布局 ==========
             var positions = new int[transitions.Count];
             var placed = new bool[transitions.Count];
 
-            // 6a. 从右往左排韵尾（非介母）
             int cursor = totalDuration - actualEnding;
             if (cursor < 0) cursor = 0;
             for (int i = transitions.Count - 1; i >= 0; i--)
@@ -585,27 +683,22 @@ namespace OpenUtau.Core
                 placed[i] = true;
             }
 
-            // 6b. 介母紧贴 main 右边缘，占据剩余空间（元音拉伸）
             for (int i = 0; i < transitions.Count; i++)
             {
                 if (!transitions[i].isMedial) continue;
-
                 int newPos = actualMain;
                 if (newPos < 0) newPos = 0;
-
-                // 下一锚点：后面第一个已定位的音素
                 int nextAnchor = totalDuration - actualEnding;
                 for (int j = i + 1; j < transitions.Count; j++)
                 {
                     if (placed[j]) { nextAnchor = positions[j]; break; }
                 }
-
-                if (newPos >= nextAnchor) newPos = Math.Max(0, nextAnchor - 10);
+                if (newPos >= nextAnchor) newPos = Math.Max(0, nextAnchor - 1);
                 positions[i] = newPos;
                 placed[i] = true;
             }
 
-            // ========== 7. 添加音素 ==========
+            // ========== 9. 添加音素 ==========
             for (int i = 0; i < transitions.Count; i++)
             {
                 phonemes.Add(new Phoneme
